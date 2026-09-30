@@ -1,350 +1,48 @@
 ---
-applyTo: '**'
+applyTo: '**/*.java'
 ---
 
-# ReplicaDB: Technical Implementation Patterns
+# ReplicaDB Java Rules
 
-## Architectural Decisions and Rationale
+## Architecture and Package Structure
+- Keep CLI parsing in `org.replicadb.cli`, core orchestration in `org.replicadb`, and managed-server responsibilities in their existing `job`, `security`, and `audit` packages.
+- Keep managed run policy and state transitions in `job.domain`, use-case contracts and services in `job.port`/`job.application`, and SQL/time/locking behavior in `job.persistence`. Controllers and execution adapters must depend on the ports where a port exists.
+- Put vendor SQL, type mapping, partitioning, and native bulk behavior in the nearest manager subclass. Keep shared lifecycle behavior in `ConnManager` or `SqlManager`.
+- Register new schemes through `SupportedManagers` and `ManagerFactory`; use `FileManagerFactory` for file formats.
+- Keep controllers and server services translating into `ToolOptions`; they must not reimplement manager behavior.
 
-### Manager Factory Pattern Implementation
-**Why chosen**: Supports 15+ heterogeneous data sources with unified interface
-**Key benefits**: Runtime database selection, clean separation of concerns, extensible design
+## Base Patterns and Abstractions
+- Preserve manager lifecycle hooks for pre-source, pre-sink, post-source, post-sink, cleanup, and release operations.
+- Adapt non-JDBC sources through row-set implementations so sink code can keep its JDBC-shaped contract.
+- Prefer an existing native path for a supported manager before adding a generic fallback or a new abstraction.
+- Use `JobRunStore`, `JobDefinitionStore`, `RunLeaseService`, `RunRecoveryService`, `RunCancellationService`, and `RunFinalizationService` for managed state operations instead of adding SQL-shaped behavior to controllers.
+- Keep retry policy validation in `RetryPolicy`; keep lease identity in `LeaseToken` and never add it to REST or frontend models.
 
-```java
-// Pattern: Database managers selected by JDBC URL scheme analysis
-public ConnManager accept(ToolOptions options, DataSourceType dsType) {
-    String scheme = extractScheme(options, dsType);
-    if (POSTGRES.isTheManagerTypeOf(options, dsType)) {
-        return new PostgresqlManager(options, dsType);
-    } else if (ORACLE.isTheManagerTypeOf(options, dsType)) {
-        return new OracleManager(options, dsType);
-    }
-    // Fallback to StandardJDBCManager for unknown databases
-    return new StandardJDBCManager(options, dsType);
-}
-```
+## Error Handling and Invariants
+- Keep source and sink resources task-owned and close them through existing lifecycle paths, including executor failure paths.
+- Preserve causes and task context when propagating failures; restore the interrupted flag after `InterruptedException`.
+- Validate null handling, precision, temporal values, LOBs, and staging ownership at the manager boundary. Do not drop user-defined staging resources.
+- Keep server errors in RFC 7807 form and redact dynamic details before API, audit, log, or telemetry output.
+- Treat a zero-row token-checked update as an explicit `FENCED` or `NOT_FOUND` result. Do not emit terminal audit success or advance a watermark unless the durable update returns `UPDATED`.
+- Persist cancellation intent before attempting the best-effort local execution signal.
 
-### Abstract SQL Manager Hierarchy
-**Why chosen**: JDBC databases share common patterns but need database-specific optimizations
-**Implementation**: Three-layer hierarchy (ConnManager → SqlManager → Database-specific)
+## Configuration and Observability
+- Read runtime behavior from `ToolOptions`; do not duplicate parsing or environment expansion inside managers.
+- Keep Log4j2 alignment, Java 17, ORC module-opening flags, and packaged launchers in sync when changing runtime configuration.
+- Treat PostgreSQL and Flyway as the managed state-store boundary; do not substitute in-memory production state.
+- Keep `available_at`, lease timestamps, and expiry backoff comparisons database-owned with PostgreSQL `now()`; keep V13/V14 forward-only and update staged migration assertions when changing them.
+- Never put passwords, DSNs, connection parameter maps, or resolved credential values in logs, Sentry context, exceptions, or test output.
 
-```java
-// Base abstraction for all data sources
-public abstract class ConnManager {
-    public abstract ResultSet readTable(String tableName, String[] columns, int nThread);
-    public abstract int insertDataToTable(ResultSet resultSet, int taskId);
-    public abstract Connection getConnection();
-}
+## Concurrency and Resilience
+- Give each run a `ReplicationExecutionContext`; do not share mutable JDBC connections or manager state across tasks.
+- Preserve cooperative cancellation and active-statement cancellation; classify driver SQL exceptions as cancellation when the run token is set.
+- Keep manager-specific partition and retry behavior explicit. Do not generalize a hash, offset, cursor, or bulk strategy from one manager.
+- Claim eligible runs with the shared lease contract and `FOR UPDATE SKIP LOCKED`; do not hold a database lock while running ReplicaDB. Expiry recovery creates a new attempt from the beginning and does not resume an abandoned run.
 
-// SQL-specific base class with common JDBC operations
-public abstract class SqlManager extends ConnManager {
-    protected Connection makeSourceConnection() throws SQLException { /* common logic */ }
-    protected ResultSet execute(String stmt, Integer fetchSize, Object... args) { /* shared implementation */ }
-}
+## Anti-Patterns
+- Do not add vendor branches to `ReplicaDB` or `SqlManager` when a manager override is the extension point.
+- Do not copy legacy JUnit 4 patterns into new Java tests.
+- Do not compare JVM-created compatibility timestamps with database-owned eligibility predicates, expose lease tokens, or remove the deprecated repository bridge before all production callers have moved to the port.
 
-// Database-specific implementations
-public class PostgresqlManager extends SqlManager {
-    // PostgreSQL-specific optimizations and SQL dialect handling
-}
-```
-
-## Module/Package Structure
-
-### Core Package Organization
-```
-org.replicadb/
-├── cli/                    # Command-line interface and option parsing
-├── config/                 # Configuration management and validation
-├── manager/                # Database connection managers
-│   ├── file/              # File system managers (CSV, ORC)
-│   └── [database]/        # Database-specific managers
-├── rowset/                # Custom ResultSet implementations
-└── time/                  # Timestamp and scheduling utilities
-```
-
-**Rationale**: Package boundaries follow functional responsibilities, making database-specific code easy to locate and maintain.
-
-### Manager Registration Pattern
-New database support requires:
-1. **Extend SqlManager** with database-specific class
-2. **Add scheme detection** in SupportedManagers enum
-3. **Register in ManagerFactory.accept()** method
-4. **Implement required abstract methods** (getDriverClass, readTable, insertDataToTable)
-
-## Essential Java Patterns and Conventions
-
-### Connection Management Pattern
-```java
-// Singleton connection pattern with lazy initialization
-@Override
-public Connection getConnection() throws SQLException {
-    if (this.connection == null) {
-        if (dsType.equals(DataSourceType.SOURCE)) {
-            this.connection = makeSourceConnection();
-        } else {
-            this.connection = makeSinkConnection();
-        }
-    }
-    return this.connection;
-}
-```
-
-### Resource Management Pattern
-```java
-// Always use try-with-resources or explicit release
-public void release() {
-    if (null != this.lastStatement) {
-        try {
-            this.lastStatement.close();
-        } catch (SQLException e) {
-            LOG.error("Exception closing executed Statement: " + e, e);
-        }
-        this.lastStatement = null;
-    }
-}
-```
-
-### Error Handling Strategy
-```java
-// Database-specific error handling with context
-try {
-    // Database operation
-} catch (SQLException e) {
-    LOG.error("Database operation failed for table: " + tableName, e);
-    throw new RuntimeException("Replication failed: " + e.getMessage(), e);
-}
-```
-
-## Framework Integration Patterns
-
-### Maven Dependency Management
-```xml
-<!-- Pattern: Version properties for consistency -->
-<properties>
-    <version.debezium>1.5.2.Final</version.debezium>
-    <version.testContainers>1.18.3</version.testContainers>
-</properties>
-
-<!-- Database drivers bundled for convenience -->
-<dependency>
-    <groupId>org.postgresql</groupId>
-    <artifactId>postgresql</artifactId>
-    <version>42.7.2</version>
-</dependency>
-```
-
-### Log4j2 Integration Pattern
-```java
-// Consistent logging across all classes
-private static final Logger LOG = LogManager.getLogger(ClassName.class.getName());
-
-// Thread-aware logging for parallel processing
-LOG.info("{}: Executing SQL statement: {}", Thread.currentThread().getName(), stmt);
-```
-
-## Testing Philosophy and Strategies
-
-### TestContainers Integration
-**Why**: Enables real database testing without external dependencies
-**Pattern**: Container-based integration tests for cross-database scenarios
-
-```java
-@Testcontainers
-class Postgres2MySQLTest {
-    @Rule
-    public static MySQLContainer<ReplicadbMysqlContainer> mysql = ReplicadbMysqlContainer.getInstance();
-    
-    @Rule
-    public static PostgreSQLContainer<ReplicadbPostgresqlContainer> postgres = ReplicadbPostgresqlContainer.getInstance();
-    
-    @Test
-    void testCompleteReplication() throws SQLException, ParseException, IOException {
-        // Test actual replication between live database containers
-        ToolOptions options = new ToolOptions(args);
-        int processedRows = ReplicaDB.processReplica(options);
-        assertEquals(TOTAL_SINK_ROWS, processedRows);
-    }
-}
-```
-
-### Test Naming Conventions
-- **Class pattern**: `{Source}2{Sink}Test` (e.g., `Postgres2MySQLTest`)
-- **Method pattern**: `test{Mode}Replication` (e.g., `testIncrementalReplication`)
-- **Integration tests**: Focus on cross-database compatibility
-- **Unit tests**: Minimal - most value in integration testing
-
-### Test Data Strategy
-```
-src/test/resources/
-├── {database}/
-│   └── {database}-source.sql    # Source table setup
-├── sinks/
-│   └── {database}-sink.sql      # Target table DDL
-└── csv/
-    └── source.csv               # File format test data
-```
-
-## Configuration Management Patterns
-
-### Property File Structure
-```properties
-# Hierarchical configuration with clear separators
-######################## ReplicadB General Options ########################
-mode=complete
-jobs=4
-fetch.size=5000
-
-############################# Source Options ##############################
-source.connect=jdbc:postgresql://localhost:5432/source
-source.user=postgres
-source.password=${POSTGRES_PASSWORD}
-source.table=employees
-
-############################# Sink Options ################################
-sink.connect=jdbc:mysql://localhost:3306/target
-sink.user=mysql
-sink.password=${MYSQL_PASSWORD}
-sink.table=employees
-```
-
-### Environment Variable Integration
-```java
-// Pattern: Support environment variable substitution
-private String resolveProperty(String value) {
-    if (value != null && value.startsWith("${") && value.endsWith("}")) {
-        String envVar = value.substring(2, value.length() - 1);
-        return System.getenv(envVar);
-    }
-    return value;
-}
-```
-
-## Performance Requirements and Implementation
-
-### Memory Management
-- **Streaming ResultSets**: Use `ResultSet.TYPE_FORWARD_ONLY` and configurable fetch sizes
-- **Connection pooling**: Single connection per thread to avoid overhead
-- **Large object handling**: Stream BLOBs/CLOBs without loading into memory
-
-### Throughput Optimization
-```java
-// Configurable fetch size for optimal performance
-statement.setFetchSize(options.getFetchSize()); // Default: 5000
-
-// Bandwidth throttling implementation
-if (bandwidthRateLimiter != null) {
-    bandwidthRateLimiter.acquire(rowSize);
-}
-```
-
-### Parallel Processing Pattern
-```java
-// ExecutorService for parallel table processing
-ExecutorService replicaTasksService = Executors.newFixedThreadPool(options.getJobs());
-for (int i = 0; i < options.getJobs(); i++) {
-    Future<Integer> replicaTaskFuture = replicaTasksService.submit(new ReplicaTask(i));
-    replicaTasksFutures.add(replicaTaskFuture);
-}
-```
-
-## Database-Specific Implementation Patterns
-
-### Type Mapping Strategy
-```java
-// Handle database-specific type conversions
-switch (resultSet.getMetaData().getColumnType(i)) {
-    case Types.CLOB:
-        // Stream CLOB data for Oracle-to-Oracle replication
-        Reader reader = resultSet.getClob(i).getCharacterStream();
-        preparedStatement.setClob(i, reader);
-        break;
-    case Types.BLOB:
-        // Handle binary data appropriately
-        preparedStatement.setBytes(i, resultSet.getBytes(i));
-        break;
-}
-```
-
-### SQL Dialect Handling
-```java
-// Database-specific SQL generation
-@Override
-public String getInsertSQLCommand(String tableName, String allColumns, int columnsNumber) {
-    // PostgreSQL-specific INSERT with ON CONFLICT handling
-    return "INSERT INTO " + tableName + " (" + allColumns + ") VALUES (" + placeholders + ") ON CONFLICT DO NOTHING";
-}
-```
-
-## Integration Patterns
-
-### File System Integration
-```java
-// Abstraction for file-based sources/sinks
-public class LocalFileManager extends ConnManager {
-    @Override
-    public ResultSet readTable(String tableName, String[] columns, int nThread) {
-        // CSV/ORC file reading implementation
-    }
-}
-```
-
-## Code Generation and Utilities
-
-### When to Use Code Generation
-- **Avoid**: Don't use code generation for database managers
-- **Prefer**: Hand-written implementations for better error handling and debugging
-- **Exception**: Build-time generation acceptable for version information
-
-### Utility Classes Pattern
-```java
-// Static utility methods for common operations
-public class DatabaseUtils {
-    public static String[] getPrimaryKeys(Connection conn, String tableName) {
-        // Common primary key detection logic
-    }
-    
-    public static void validateConnection(Connection conn) throws SQLException {
-        // Standard connection validation
-    }
-}
-```
-
-## Development Workflow Guidelines
-
-### Adding New Database Support
-1. **Create manager class** extending SqlManager
-2. **Implement abstract methods** with database-specific logic
-3. **Add scheme detection** in SupportedManagers
-4. **Register in ManagerFactory**
-5. **Create integration tests** with TestContainers
-6. **Update documentation** with connection examples
-
-### Performance Optimization Process
-1. **Profile with realistic data volumes** (not toy datasets)
-2. **Measure memory usage** under different fetch sizes
-3. **Test parallel processing** with actual database load
-4. **Validate bandwidth throttling** in network-constrained environments
-
-### Error Handling Best Practices
-- **Preserve original exceptions** in stack traces
-- **Log context information** (table names, row counts, connection details)
-- **Fail fast** on configuration errors
-- **Retry transient errors** with exponential backoff
-
-## Anti-Patterns to Avoid
-
-### Database Connection Anti-Patterns
-- **DON'T**: Create new connections per query
-- **DO**: Use singleton connection pattern with proper cleanup
-
-### Memory Anti-Patterns
-- **DON'T**: Load entire ResultSet into memory
-- **DO**: Use streaming with appropriate fetch sizes
-
-### Error Handling Anti-Patterns
-- **DON'T**: Catch and ignore SQLExceptions
-- **DO**: Log errors with context and propagate appropriately
-
-### Testing Anti-Patterns
-- **DON'T**: Use H2 or embedded databases for integration tests
-- **DO**: Test against actual database engines using TestContainers
+## Contradiction Check
+No organization baseline was available in this checkout, so no contradiction or project override was recorded.

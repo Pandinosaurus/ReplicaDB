@@ -51,6 +51,14 @@ public class ReplicadbMongodbContainer extends MongoDBContainer {
 
 			// Ensure collections are properly created
 			try {
+				// Reset source collection to avoid duplicate _id errors on container reuse
+				try {
+					database.getCollection(T_SOURCE_COLLECTION).drop();
+					LOG.info("Dropped existing {} collection before loading test data", T_SOURCE_COLLECTION);
+				} catch (final Exception dropException) {
+					LOG.debug("No existing {} collection to drop: {}", T_SOURCE_COLLECTION, dropException.getMessage());
+				}
+
 				// Create source collection and load data
 				final List<String> allLines = Files.readAllLines(Paths.get(RESOURCE_DIR + SOURCE_FILE));
 				for (final String line : allLines) {
@@ -64,6 +72,14 @@ public class ReplicadbMongodbContainer extends MongoDBContainer {
 				final long count = database.getCollection(T_SOURCE_COLLECTION).countDocuments();
 				LOG.info("Inserted " + count + " documents into the '" + T_SOURCE_COLLECTION + "' collection");
 				LOG.info("First document: " + database.getCollection(T_SOURCE_COLLECTION).find().first().toJson());
+
+				// Reset sink collection to ensure consistent test state
+				try {
+					database.getCollection("t_sink").drop();
+					LOG.info("Dropped existing t_sink collection before test setup");
+				} catch (final Exception dropException) {
+					LOG.debug("No existing t_sink collection to drop: {}", dropException.getMessage());
+				}
 
 				// Create sink collection with proper error handling
 				try {
@@ -105,10 +121,10 @@ public class ReplicadbMongodbContainer extends MongoDBContainer {
 		final String collectionName = "t_sink";
 
 		try {
-			// Create unique index with proper field name
+			// Create unique sparse index - sparse allows multiple NULL values
 			database.getCollection(collectionName).createIndex(new Document(indexFieldName, 1),
-					new IndexOptions().unique(true).name("idx_unique_c_integer"));
-			LOG.info("Created unique index 'idx_unique_c_integer' on field '{}'", indexFieldName);
+					new IndexOptions().unique(true).sparse(true).name("idx_unique_c_integer"));
+			LOG.info("Created unique sparse index 'idx_unique_c_integer' on field '{}'", indexFieldName);
 
 			// Validate the index was created successfully
 			if (this.validateUniqueIndexExists(database, collectionName, indexFieldName)) {

@@ -5,11 +5,25 @@ import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.manager.util.BandwidthThrottling;
+import org.replicadb.manager.util.WatermarkBinder;
 
 import java.io.IOException;
 import java.sql.*;
 
-
+/**
+ * Generic JDBC manager for databases without specialized implementations.
+ * Used as fallback when no database-specific manager is available.
+ * 
+ * <p><b>NULL Handling:</b> Correctly preserves NULL values for all data types by checking
+ * {@code ResultSet.wasNull()} after primitive getters and calling {@code PreparedStatement.setNull()}
+ * when NULL is detected. Prevents silent NULL-to-default-value conversions.</p>
+ * 
+ * <p>Includes explicit handling for BOOLEAN and NVARCHAR types in addition to standard
+ * primitive types (INTEGER, BIGINT, DOUBLE, FLOAT, DATE, TIMESTAMP, VARCHAR, BINARY).</p>
+ * 
+ * @see OracleManager For detailed NULL handling pattern documentation
+ * @see <a href="https://github.com/osalvador/ReplicaDB/issues/51">Issue #51</a>
+ */
 public class StandardJDBCManager extends SqlManager {
 
    private static final Logger LOG = LogManager.getLogger(StandardJDBCManager.class.getName());
@@ -58,6 +72,8 @@ public class StandardJDBCManager extends SqlManager {
       if (options.getSourceQuery() != null && !options.getSourceQuery().isEmpty()) {
          sqlCmd = "SELECT  * FROM (" +
              options.getSourceQuery() + ") as T1 ";
+
+         return super.execute(sqlCmd);
       } else {
 
          sqlCmd = "SELECT " +
@@ -70,9 +86,16 @@ public class StandardJDBCManager extends SqlManager {
             sqlCmd = sqlCmd + " WHERE " + options.getSourceWhere();
          }
 
-      }
+         if (options.getIncrementalWatermarkColumn() != null && options.getIncrementalWatermarkValue() != null) {
+            Object watermarkBindValue = WatermarkBinder.convertToBoundValue(options.getIncrementalWatermarkValue(),
+                WatermarkBinder.resolveColumnType(options.getSourceColumnDescriptors(), options.getIncrementalWatermarkColumn()));
+            sqlCmd = sqlCmd + (sqlCmd.contains(" WHERE ") ? " AND " : " WHERE ")
+                + escapeColName(options.getIncrementalWatermarkColumn()) + " > ?";
+            return super.execute(sqlCmd, watermarkBindValue);
+         }
 
-      return super.execute(sqlCmd);
+         return super.execute(sqlCmd);
+      }
 
    }
 
@@ -94,7 +117,9 @@ public class StandardJDBCManager extends SqlManager {
 
       String sqlCdm = getInsertSQLCommand(tableName, allColumns, columnsNumber);
       PreparedStatement ps = this.getConnection().prepareStatement(sqlCdm);
+      registerActiveStatement(ps);
 
+      try {
       final int batchSize = options.getFetchSize();
       int count = 0;
 
@@ -105,6 +130,7 @@ public class StandardJDBCManager extends SqlManager {
          BandwidthThrottling bt = new BandwidthThrottling(options.getBandwidthThrottling(), options.getFetchSize(), resultSet);
 
          do {
+            checkCancellation();
             bt.acquiere();
 
             // Get Columns values
@@ -114,35 +140,77 @@ public class StandardJDBCManager extends SqlManager {
                   case Types.VARCHAR:
                   case Types.CHAR:
                   case Types.LONGVARCHAR:
-                     ps.setString(i, resultSet.getString(i));
+                     String strVal = resultSet.getString(i);
+                     if (resultSet.wasNull() || strVal == null) {
+                        ps.setNull(i, Types.VARCHAR);
+                     } else {
+                        ps.setString(i, strVal);
+                     }
                      break;
                   case Types.INTEGER:
                   case Types.TINYINT:
                   case Types.SMALLINT:
-                     ps.setInt(i, resultSet.getInt(i));
+                     int intVal = resultSet.getInt(i);
+                     if (resultSet.wasNull()) {
+                        ps.setNull(i, Types.INTEGER);
+                     } else {
+                        ps.setInt(i, intVal);
+                     }
                      break;
                   case Types.BIGINT:
                   case Types.NUMERIC:
                   case Types.DECIMAL:
-                     ps.setBigDecimal(i, resultSet.getBigDecimal(i));
+                     java.math.BigDecimal bdVal = resultSet.getBigDecimal(i);
+                     if (resultSet.wasNull() || bdVal == null) {
+                        ps.setNull(i, Types.NUMERIC);
+                     } else {
+                        ps.setBigDecimal(i, bdVal);
+                     }
                      break;
                   case Types.DOUBLE:
-                     ps.setDouble(i, resultSet.getDouble(i));
+                     double doubleVal = resultSet.getDouble(i);
+                     if (resultSet.wasNull()) {
+                        ps.setNull(i, Types.DOUBLE);
+                     } else {
+                        ps.setDouble(i, doubleVal);
+                     }
                      break;
                   case Types.FLOAT:
-                     ps.setFloat(i, resultSet.getFloat(i));
+                     float floatVal = resultSet.getFloat(i);
+                     if (resultSet.wasNull()) {
+                        ps.setNull(i, Types.FLOAT);
+                     } else {
+                        ps.setFloat(i, floatVal);
+                     }
                      break;
                   case Types.DATE:
-                     ps.setDate(i, resultSet.getDate(i));
+                     java.sql.Date dateVal = resultSet.getDate(i);
+                     if (resultSet.wasNull() || dateVal == null) {
+                        ps.setNull(i, Types.DATE);
+                     } else {
+                        ps.setDate(i, dateVal);
+                     }
                      break;
                   case Types.TIMESTAMP:
                   case Types.TIMESTAMP_WITH_TIMEZONE:
                   case -101:
                   case -102:
-                     ps.setTimestamp(i, resultSet.getTimestamp(i));
+                     java.sql.Timestamp tsVal = resultSet.getTimestamp(i);
+                     if (resultSet.wasNull() || tsVal == null) {
+                        ps.setNull(i, Types.TIMESTAMP);
+                     } else {
+                        ps.setTimestamp(i, tsVal);
+                     }
                      break;
                   case Types.BINARY:
-                     ps.setBytes(i, resultSet.getBytes(i));
+                  case Types.VARBINARY:
+                  case Types.LONGVARBINARY:
+                     byte[] bytesVal = resultSet.getBytes(i);
+                     if (resultSet.wasNull() || bytesVal == null) {
+                        ps.setNull(i, rsmd.getColumnType(i));
+                     } else {
+                        ps.setBytes(i, bytesVal);
+                     }
                      break;
                   case Types.BLOB:
                      Blob blobData = resultSet.getBlob(i);
@@ -155,10 +223,20 @@ public class StandardJDBCManager extends SqlManager {
                      if (clobData != null) clobData.free();
                      break;
                   case Types.BOOLEAN:
-                     ps.setBoolean(i, resultSet.getBoolean(i));
+                     boolean boolVal = resultSet.getBoolean(i);
+                     if (resultSet.wasNull()) {
+                        ps.setNull(i, Types.BOOLEAN);
+                     } else {
+                        ps.setBoolean(i, boolVal);
+                     }
                      break;
                   case Types.NVARCHAR:
-                     ps.setNString(i, resultSet.getNString(i));
+                     String nStrVal = resultSet.getNString(i);
+                     if (resultSet.wasNull() || nStrVal == null) {
+                        ps.setNull(i, Types.NVARCHAR);
+                     } else {
+                        ps.setNString(i, nStrVal);
+                     }
                      break;
                   case Types.SQLXML:
                      SQLXML sqlxmlData = resultSet.getSQLXML(i);
@@ -193,10 +271,12 @@ public class StandardJDBCManager extends SqlManager {
       }
 
       ps.executeBatch(); // insert remaining records
-      ps.close();
-
       this.getConnection().commit();
       return totalRows;
+      } finally {
+         unregisterActiveStatement(ps);
+         ps.close();
+      }
    }
 
    private String getInsertSQLCommand (String tableName, String allColumns, int columnsNumber) {
@@ -223,6 +303,91 @@ public class StandardJDBCManager extends SqlManager {
    }
 
    @Override
+   protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+      // Generic ANSI SQL types - use portable, widely-supported syntax
+      switch (jdbcType) {
+         // Character types
+         case Types.CHAR:
+            return precision > 0 && precision <= 2000 ? "CHAR(" + precision + ")" : "CHAR(255)";
+         case Types.VARCHAR:
+         case Types.LONGVARCHAR:
+            if (precision <= 0 || precision > 4000) {
+               return "VARCHAR(4000)";
+            }
+            return "VARCHAR(" + precision + ")";
+         case Types.NCHAR:
+            return precision > 0 && precision <= 2000 ? "NCHAR(" + precision + ")" : "NCHAR(255)";
+         case Types.NVARCHAR:
+         case Types.LONGNVARCHAR:
+            if (precision <= 0 || precision > 4000) {
+               return "NVARCHAR(4000)";
+            }
+            return "NVARCHAR(" + precision + ")";
+         
+         // Numeric types
+         case Types.TINYINT:
+            return "SMALLINT";
+         case Types.SMALLINT:
+            return "SMALLINT";
+         case Types.INTEGER:
+            return "INTEGER";
+         case Types.BIGINT:
+            return "BIGINT";
+         case Types.DECIMAL:
+         case Types.NUMERIC:
+            if (precision > 0 && scale >= 0) {
+               return "DECIMAL(" + Math.min(precision, 38) + "," + Math.min(scale, 38) + ")";
+            }
+            return "DECIMAL(18,0)";
+         case Types.REAL:
+            return "REAL";
+         case Types.FLOAT:
+            return "FLOAT";
+         case Types.DOUBLE:
+            return "DOUBLE PRECISION";
+         
+         // Date/Time types
+         case Types.DATE:
+            return "DATE";
+         case Types.TIME:
+         case Types.TIME_WITH_TIMEZONE:
+            return "TIME";
+         case Types.TIMESTAMP:
+         case Types.TIMESTAMP_WITH_TIMEZONE:
+            return "TIMESTAMP";
+         
+         // Binary types
+         case Types.BINARY:
+            return precision > 0 && precision <= 2000 ? "BINARY(" + precision + ")" : "BINARY(255)";
+         case Types.VARBINARY:
+         case Types.LONGVARBINARY:
+            if (precision <= 0 || precision > 4000) {
+               return "VARBINARY(4000)";
+            }
+            return "VARBINARY(" + precision + ")";
+         case Types.BLOB:
+            return "BLOB";
+         
+         // Other types
+         case Types.BOOLEAN:
+         case Types.BIT:
+            return "BOOLEAN";
+         case Types.CLOB:
+            return "CLOB";
+         case Types.NCLOB:
+            return "NCLOB";
+         case Types.ROWID:
+            return "VARCHAR(40)";
+         case Types.SQLXML:
+            return "CLOB";
+         
+         default:
+            LOG.warn("Unmapped JDBC type {} for column '{}', defaulting to VARCHAR(4000)", jdbcType, columnName);
+            return "VARCHAR(4000)";
+      }
+   }
+
+   @Override
    protected void createStagingTable () throws SQLException {
       // Not necessary
    }
@@ -232,15 +397,16 @@ public class StandardJDBCManager extends SqlManager {
    }
    @Override
    public void preSourceTasks () throws Exception {
-      // Not necessary
+      // Call parent to probe source metadata if auto-create is enabled
+      super.preSourceTasks();
+      // No other StandardJDBC-specific pre-source tasks needed.
    }
    @Override
    protected void mergeStagingTable () throws Exception {
-      // Not necessary
+      checkCancellation();
    }
-
    @Override
    protected void truncateTable () throws SQLException {
-      super.truncateTable("DELETE ");
+      super.truncateTable("TRUNCATE TABLE ");
    }
 }

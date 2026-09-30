@@ -3,14 +3,12 @@ package org.replicadb.sqlserver;
 import org.apache.commons.cli.ParseException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Rule;
 import org.junit.jupiter.api.*;
 import org.replicadb.ReplicaDB;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.config.ReplicadbSqlserverContainer;
 import org.replicadb.manager.file.FileFormats;
-import org.replicadb.manager.file.FileManager;
 import org.testcontainers.containers.MSSQLServerContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -21,7 +19,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
-import java.util.HashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -38,7 +35,6 @@ class Sqlserver2CsvFileTest {
 
    private Connection sqlserverConn;
 
-   @Rule
    public static MSSQLServerContainer<ReplicadbSqlserverContainer> sqlserver = ReplicadbSqlserverContainer.getInstance();
 
    @BeforeAll
@@ -57,8 +53,6 @@ class Sqlserver2CsvFileTest {
       LOG.info("Deleted file: {}", sinkFile.delete());
       this.sqlserverConn.close();
 
-      // Clean the static temFiles HasMap.
-      FileManager.setTempFilesPath(new HashMap<>());
    }
 
 
@@ -71,13 +65,13 @@ class Sqlserver2CsvFileTest {
 
 
    @Test
-   void testSqlserverVersion2017 () throws SQLException {
+   void testSqlserverVersion2019 () throws SQLException {
       Statement stmt = sqlserverConn.createStatement();
       ResultSet rs = stmt.executeQuery("SELECT @@VERSION");
       rs.next();
       String version = rs.getString(1);
       LOG.info(version);
-      assertTrue(version.contains("2017"));
+      assertTrue(version.contains("2019"));
    }
 
    @Test

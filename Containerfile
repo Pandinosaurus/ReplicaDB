@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/openjdk-11-runtime
+FROM registry.access.redhat.com/ubi9/openjdk-17-runtime
 LABEL maintainer Oscar Salvador Magallanes
 LABEL maintainer Francesco Zanti <francesco@tekapp.it> 
 
@@ -13,6 +13,7 @@ USER "${USERNAME}:${USERNAME}"
 
 ARG REPLICADB_RELEASE_VERSION=0.0.0
 ENV REPLICADB_VERSION=$REPLICADB_RELEASE_VERSION
+ENV REPLICADB_HEADLESS=true
 
 WORKDIR /home/${USERNAME}
 

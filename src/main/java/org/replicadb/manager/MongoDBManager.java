@@ -14,7 +14,6 @@ import org.bson.codecs.BsonArrayCodec;
 import org.bson.codecs.DecoderContext;
 import org.bson.json.JsonParseException;
 import org.bson.json.JsonReader;
-import org.jetbrains.annotations.NotNull;
 import org.postgresql.util.PGobject;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
@@ -25,7 +24,9 @@ import org.replicadb.rowset.MongoDBRowSetImpl;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -219,7 +220,6 @@ public class MongoDBManager extends SqlManager {
 		return this.mongoDbResultSet;
 	}
 
-	@NotNull
 	private static List<BsonDocument> getAggregation(String queryAggregation) {
 		// parse the aggregation query string into a List of BsonDocument
 		return new BsonArrayCodec().decode(new JsonReader(queryAggregation), DecoderContext.builder().build()).stream()
@@ -241,15 +241,20 @@ public class MongoDBManager extends SqlManager {
 		final String collectionName = this.getInsertDataCollection();
 
 		final MongoCollection<Document> sinkCollection = this.sinkDatabase.getCollection(collectionName);
+		if (ReplicationMode.INCREMENTAL.getModeText().equals(this.options.getMode())) {
+			this.ensurePrimaryKeysInitialized(sinkCollection);
+		}
 		final List<WriteModel<Document>> writeOperations = new ArrayList<>();
 		// unordered bulk write
 		final BulkWriteOptions bulkWriteOptions = new BulkWriteOptions().ordered(false);
+		final Map<String, String> primaryKeyNormalizationMap = buildPrimaryKeyNormalizationMap();
 
 		if (resultSet != null && resultSet.next()) {
 			// Create Bandwidth Throttling
 			final BandwidthThrottling bt = new BandwidthThrottling(this.options.getBandwidthThrottling(),
 					this.options.getFetchSize(), resultSet);
 			do {
+				checkCancellation();
 				bt.acquiere();
 				if (this.isSourceAndSinkMongoDB()) {
 					// Add document to bulk
@@ -258,34 +263,42 @@ public class MongoDBManager extends SqlManager {
 					// iterate columns
 					final Document document = new Document();
 					for (int i = 1; i <= resultSet.getMetaData().getColumnCount(); i++) {
-						final String columnName = resultSet.getMetaData().getColumnName(i);
+						final String columnName = resultSet.getMetaData().getColumnLabel(i);
+						// Normalize column names: prioritize primary key normalization, otherwise lowercase for consistency
+						// SQL databases (especially DB2) return uppercase column names even with lowercase AS aliases
+						final String normalizedColumnName = normalizePrimaryKeyName(primaryKeyNormalizationMap,
+								columnName);
+						// If not a primary key, ensure lowercase for MongoDB consistency
+						final String finalColumnName = normalizedColumnName.equals(columnName) 
+								? columnName.toLowerCase() 
+								: normalizedColumnName;
 						switch (resultSet.getMetaData().getColumnType(i)) {
 							case -104 : // Oracle INTERVALDS
 							case -103 : // Oracle INTERVALYM
 							case Types.SQLXML :
-								document.put(columnName, resultSet.getString(i));
+								document.put(finalColumnName, resultSet.getString(i));
 								break;
 							case Types.TIMESTAMP :
 							case Types.TIMESTAMP_WITH_TIMEZONE :
 							case -101 :
 							case -102 :
-								document.put(columnName, resultSet.getTimestamp(i));
+								document.put(finalColumnName, resultSet.getTimestamp(i));
 								break;
 							case Types.BINARY :
 							case Types.VARBINARY :
 							case Types.LONGVARBINARY :
-								document.put(columnName, resultSet.getBytes(i));
+								document.put(finalColumnName, resultSet.getBytes(i));
 								break;
 							case Types.BLOB :
 								final Blob blobData = resultSet.getBlob(i);
 								if (blobData != null) {
-									document.put(columnName, blobData.getBytes(1, (int) blobData.length()));
+									document.put(finalColumnName, blobData.getBytes(1, (int) blobData.length()));
 									blobData.free();
 								}
 								break;
 							case Types.CLOB :
 								final Clob clobData = resultSet.getClob(i);
-								document.put(columnName, this.clobToString(clobData));
+								document.put(finalColumnName, this.clobToString(clobData));
 								if (clobData != null)
 									clobData.free();
 								break;
@@ -295,16 +308,16 @@ public class MongoDBManager extends SqlManager {
 									final PGobject pgObject = (PGobject) object;
 									// if Document.parse fails, will be saved as a string
 									try {
-										document.put(columnName, Document.parse(pgObject.getValue()));
+										document.put(finalColumnName, Document.parse(pgObject.getValue()));
 									} catch (final Exception e) {
-										document.put(columnName, pgObject.getValue());
+										document.put(finalColumnName, pgObject.getValue());
 									}
 								} else {
-									document.put(columnName, object);
+									document.put(finalColumnName, object);
 								}
 								break;
 							default :
-								document.put(columnName, resultSet.getObject(i));
+								document.put(finalColumnName, resultSet.getObject(i));
 								break;
 						}
 					}
@@ -330,6 +343,13 @@ public class MongoDBManager extends SqlManager {
 		return totalRows;
 	}
 
+	private void ensurePrimaryKeysInitialized(MongoCollection<Document> sinkCollection) {
+		if (this.primaryKeys == null || this.primaryKeys.isEmpty()) {
+			final List<String> primaryKeys = this.getUniqueIndexFields(sinkCollection);
+			this.setPrimaryKeys(primaryKeys);
+		}
+	}
+
 	private String getInsertDataCollection() {
 		// get collection name
 		final String collectionName;
@@ -346,6 +366,11 @@ public class MongoDBManager extends SqlManager {
 		// MongoDB does not use JDBC drivers, so this method does not need to be
 		// implemented
 		return null;
+	}
+
+	@Override
+	protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+		throw new UnsupportedOperationException("MongoDB does not support SQL DDL. Use --sink-auto-create only with SQL databases.");
 	}
 
 	@Override
@@ -503,6 +528,27 @@ public class MongoDBManager extends SqlManager {
 		this.primaryKeys = primaryKeys;
 	}
 
+	private Map<String, String> buildPrimaryKeyNormalizationMap() {
+		final Map<String, String> normalizationMap = new HashMap<>();
+		if (this.primaryKeys == null) {
+			return normalizationMap;
+		}
+		for (final String key : this.primaryKeys) {
+			if (key != null) {
+				normalizationMap.put(key.toLowerCase(), key);
+			}
+		}
+		return normalizationMap;
+	}
+
+	private String normalizePrimaryKeyName(Map<String, String> normalizationMap, String columnName) {
+		if (columnName == null || normalizationMap.isEmpty()) {
+			return columnName;
+		}
+		String normalized = normalizationMap.get(columnName.toLowerCase());
+		return normalized != null ? normalized : columnName;
+	}
+
 	/**
 	 * Validates that a unique index exists on the sink collection for the specified
 	 * fields. MongoDB's $merge operation requires a unique index on the target
@@ -605,8 +651,47 @@ public class MongoDBManager extends SqlManager {
 		}
 	}
 
+	/**
+	 * Validates that all documents in the staging collection have non-null values
+	 * for the merge key fields. MongoDB's $merge with sparse indexes will fail if
+	 * any document has null/missing values in the 'on' fields.
+	 *
+	 * @param stagingCollection
+	 *            the staging collection to validate
+	 * @param mergeKeyFields
+	 *            the fields used as merge keys
+	 * @throws IllegalStateException
+	 *             if any document has null merge key values
+	 */
+	private void validateStagingDataForMerge(MongoCollection<Document> stagingCollection,
+			List<String> mergeKeyFields) {
+		// Build query to find documents with null/missing merge key fields
+		final List<Document> orConditions = new ArrayList<>();
+		for (final String field : mergeKeyFields) {
+			orConditions.add(new Document(field, new Document("$exists", false)));
+			orConditions.add(new Document(field, null));
+		}
+
+		final Document nullCheckQuery = new Document("$or", orConditions);
+		final long docsWithNullKeys = stagingCollection.countDocuments(nullCheckQuery);
+
+		if (docsWithNullKeys > 0) {
+			LOG.error("Found {} documents in staging collection with null/missing merge key fields: {}",
+					docsWithNullKeys, mergeKeyFields);
+			throw new IllegalStateException(String.format(
+					"Staging collection contains %d documents with null or missing values in merge key fields %s. "
+							+ "All merge key fields must be non-null for incremental mode. "
+							+ "Verify that source query includes these fields with proper aliases to match the sink collection's unique index.",
+					docsWithNullKeys, mergeKeyFields));
+		}
+
+		LOG.info("Validated {} documents in staging collection have non-null merge key fields {}",
+				stagingCollection.countDocuments(), mergeKeyFields);
+	}
+
 	@Override
 	protected void mergeStagingTable() throws Exception {
+		checkCancellation();
 
 		this.getConnection();
 
@@ -621,6 +706,10 @@ public class MongoDBManager extends SqlManager {
 			// 'on' fields
 			LOG.info("Validating unique index on sink collection for merge operation");
 			this.ensureUniqueIndexExists(sinkCollection, this.primaryKeys);
+
+			// Validate staging data has non-null values for merge keys
+			LOG.info("Validating staging collection data for merge operation");
+			this.validateStagingDataForMerge(sinkStagingCollection, this.primaryKeys);
 
 			String aggregationQuery = "[ {$project: {_id:0}},{$merge:{ into:\"${SINK_COLLECTION}\", on:[${PRIMARY_KEYS}], whenMatched: \"replace\", whenNotMatched: \"insert\" }} ]";
 			aggregationQuery = aggregationQuery.replace("${SINK_COLLECTION}", this.getSinkTableName());

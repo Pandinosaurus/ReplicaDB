@@ -9,7 +9,6 @@ import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.config.ReplicadbPostgresqlContainer;
 import org.replicadb.manager.file.FileFormats;
-import org.replicadb.manager.file.FileManager;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -21,7 +20,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
-import java.util.HashMap;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -51,6 +49,22 @@ class Postgres2CsvFileTest {
 	void before() throws SQLException {
 		this.postgresConn = DriverManager.getConnection(postgres.getJdbcUrl(), postgres.getUsername(),
 				postgres.getPassword());
+		
+		// Clean up any leftover temp files from previous tests
+		final File tmpDir = new File("/tmp");
+		final File[] tempFiles = tmpDir.listFiles((dir, name) -> name.contains("fileSink.csv.repdb."));
+		if (tempFiles != null) {
+			for (final File f : tempFiles) {
+				LOG.info("Deleting leftover temp file: {}", f.delete() ? f.getName() : "FAILED: " + f.getName());
+			}
+		}
+		
+		
+		// Ensure sink file is deleted before test
+		final File sinkFile = new File(URI.create(SINK_FILE_URI_PATH));
+		if (sinkFile.exists()) {
+			LOG.info("Deleting sink file before test: {}", sinkFile.delete());
+		}
 	}
 
 	@AfterEach
@@ -59,8 +73,6 @@ class Postgres2CsvFileTest {
 		LOG.info("Deleted file: {}", sinkFile.delete());
 		this.postgresConn.close();
 
-		// Clean the static tempFiles HashMap.
-		FileManager.setTempFilesPath(new HashMap<>());
 	}
 
 	public int countSinkRows() throws IOException {

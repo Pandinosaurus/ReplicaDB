@@ -3,7 +3,6 @@ package org.replicadb.file;
 import org.apache.commons.cli.ParseException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Rule;
 import org.junit.jupiter.api.*;
 import org.replicadb.ReplicaDB;
 import org.replicadb.cli.ToolOptions;
@@ -30,11 +29,10 @@ class Csv2SqlserverTest {
 
    private static final String SOURCE_COLUMNS = "C_VARCHAR,C_CHAR,C_LONGVARCHAR,C_INTEGER,C_BIGINT,C_TINYINT,C_SMALLINT,C_NUMERIC,C_DECIMAL,C_DOUBLE,C_FLOAT,C_DATE,C_TIMESTAMP,C_TIME,C_BOOLEAN";
    private static final String SOURCE_COLUMNS_TYPES ="VARCHAR, CHAR, LONGVARCHAR, INTEGER, BIGINT, TINYINT, SMALLINT, NUMERIC, DECIMAL, DOUBLE, DOUBLE, DATE, TIMESTAMP, TIME, BOOLEAN" ;
-   private static final String SINK_COLUMNS = "c_character_var,c_character,c_character_lob,c_integer,c_bigint,c_smallint,c_real,c_numeric,c_decimal,c_double_precision,c_float,c_date,c_timestamp_without_timezone,c_time_without_timezone";
+   private static final String SINK_COLUMNS = "c_character_var,c_character,c_character_lob,c_integer,c_bigint,c_smallint,c_real,c_numeric,c_decimal,c_double_precision,c_float,c_date,c_timestamp_without_timezone,c_time_without_timezone,c_boolean";
 
    private Connection sqlserverConn;
 
-   @Rule
    public static MSSQLServerContainer<ReplicadbSqlserverContainer> sqlserver = ReplicadbSqlserverContainer.getInstance();
 
    @BeforeAll
@@ -64,13 +62,13 @@ class Csv2SqlserverTest {
    }
 
    @Test
-   void testSqlserverVersion2017 () throws SQLException {
+   void testSqlserverVersion2019 () throws SQLException {
       Statement stmt = sqlserverConn.createStatement();
       ResultSet rs = stmt.executeQuery("SELECT @@VERSION");
       rs.next();
       String version = rs.getString(1);
       LOG.info(version);
-      assertTrue(version.contains("2017"));
+      assertTrue(version.contains("2019"));
    }
 
    @Test

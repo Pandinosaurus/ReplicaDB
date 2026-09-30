@@ -6,16 +6,18 @@
 
     <groupId>org.replicadb</groupId>
     <artifactId>ReplicaDB</artifactId>
-    <version>0.15.1</version>
+    <version>1.0.2</version>
 
     <name>ReplicaDB</name>
     <url>https://github.com/osalvador/ReplicaDB</url>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
-        <version.testContainers>1.21.3</version.testContainers>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <version.testContainers>1.21.4</version.testContainers>
+        <version.junit>6.1.3</version.junit>
+        <version.azure-identity>1.18.6</version.azure-identity>
     </properties>
 
 
@@ -24,7 +26,7 @@
             <dependency>
                 <groupId>com.amazonaws</groupId>
                 <artifactId>aws-java-sdk-bom</artifactId>
-                <version>1.11.106</version>
+                <version>1.12.797</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -37,19 +39,25 @@
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
-            <version>5.4.2</version>
+            <version>${version.junit}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-params</artifactId>
-            <version>5.4.2</version>
+            <version>${version.junit}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-engine</artifactId>
-            <version>5.4.2</version>
+            <version>${version.junit}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.23.0</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -106,47 +114,55 @@
             <version>${version.testContainers}</version>
             <scope>test</scope>
         </dependency>
-
-
         <dependency>
-            <groupId>mysql</groupId>
-            <artifactId>mysql-connector-java</artifactId>
-            <version>8.0.28</version>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>localstack</artifactId>
+            <version>${version.testContainers}</version>
+            <scope>test</scope>
+        </dependency>
+
+
+        <!-- MySQL Connector - Updated to fix CVE-2023-22102: takeover vulnerability affecting versions <= 8.0.33 -->
+        <!-- Using com.mysql:mysql-connector-j (new artifact ID since 8.0.31) -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>26.7.0</version>
             <scope>provided</scope>
         </dependency>
 
-        <!-- Logging -->
+        <!-- Logging - Updated to fix CVE: Socket Appender TLS hostname verification vulnerability -->
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-api</artifactId>
-            <version>2.17.1</version>
+            <version>2.25.5</version>
         </dependency>
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-core</artifactId>
-            <version>2.17.1</version>
+            <version>2.26.1</version>
         </dependency>
 
         <!-- Commons -->
         <dependency>
             <groupId>commons-cli</groupId>
             <artifactId>commons-cli</artifactId>
-            <version>1.4</version>
+            <version>1.11.0</version>
         </dependency>
         <dependency>
             <groupId>commons-io</groupId>
             <artifactId>commons-io</artifactId>
-            <version>2.8.0</version>
+            <version>2.22.0</version>
         </dependency>
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-csv</artifactId>
-            <version>1.7</version>
+            <version>1.14.1</version>
         </dependency>
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
-            <version>3.9</version>
+            <version>3.20.0</version>
         </dependency>
 
         <dependency>
@@ -159,19 +175,19 @@
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
-            <version>2.7.0</version>
+            <version>4.3.1</version>
         </dependency>
 
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
-            <version>42.7.2</version>
+            <version>42.7.13</version>
         </dependency>
 
         <dependency>
             <groupId>de.siegmar</groupId>
             <artifactId>fastcsv</artifactId>
-            <version>1.0.3</version>
+            <version>4.4.0</version>
         </dependency>
 
         <!-- Oracle -->
@@ -185,31 +201,31 @@
         <dependency>
             <groupId>com.oracle.database.jdbc</groupId>
             <artifactId>ojdbc11</artifactId>
-            <version>23.3.0.23.09</version>
+            <version>23.26.3.0.0</version>
         </dependency>
         <!-- Oracle internationalization support -->
         <dependency>
             <groupId>com.oracle.database.nls</groupId>
             <artifactId>orai18n</artifactId>
-            <version>23.3.0.23.09</version>
+            <version>23.26.3.0.0</version>
         </dependency>
         <!-- Oracle XML support -->
         <dependency>
             <groupId>com.oracle.database.xml</groupId>
             <artifactId>xdb</artifactId>
-            <version>23.3.0.23.09</version>
+            <version>23.26.1.0.0</version>
         </dependency>
         <!-- Oracle XML parser for XMLParseException and related classes -->
         <dependency>
             <groupId>com.oracle.database.xml</groupId>
             <artifactId>xmlparserv2</artifactId>
-            <version>23.3.0.23.09</version>
+            <version>23.26.3.0.0</version>
         </dependency>
         <!-- Oracle XML DB support for XMLType processing -->
         <dependency>
             <groupId>com.oracle.database.xml</groupId>
             <artifactId>xmlparserv2_sans_jaxp_services</artifactId>
-            <version>23.3.0.23.09</version>
+            <version>23.26.3.0.0</version>
         </dependency>
 
 
@@ -217,7 +233,7 @@
         <dependency>
             <groupId>org.mariadb.jdbc</groupId>
             <artifactId>mariadb-java-client</artifactId>
-            <version>2.7.3</version>
+            <version>3.5.10</version>
         </dependency>
 
 
@@ -229,23 +245,31 @@
         <!--</dependency>-->
 
 
+        <!-- SLF4J to Log4j2 bridge -->
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-            <version>1.7.25</version>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j-impl</artifactId>
+            <version>2.25.4</version>
         </dependency>
-
+        
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>2.12.7.1</version>
+            <version>2.22.2</version>
         </dependency>
 
-        <!-- SQL Server -->
+        <!-- SQL Server -->        
         <dependency>
             <groupId>com.microsoft.sqlserver</groupId>
             <artifactId>mssql-jdbc</artifactId>
-            <version>7.2.2.jre8</version>
+            <version>13.2.1.jre11</version>
+        </dependency>
+
+        <!-- Microsoft Entra authentication support for the SQL Server driver -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-identity</artifactId>
+            <version>${version.azure-identity}</version>
         </dependency>
 
         <!-- Amazon S3 -->
@@ -266,57 +290,98 @@
             <version>3.41.2.2</version>
         </dependency>
 
+        <!-- DuckDB -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>1.5.5.1</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- DB2 -->
         <dependency>
             <groupId>com.ibm.db2</groupId>
             <artifactId>jcc</artifactId>
-            <version>11.5.0.0</version>
-            <scope>test</scope>
+            <version>12.1.5.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- IBM JTOpen - Open source driver for DB2/i (AS/400) -->
+        <dependency>
+            <groupId>net.sf.jt400</groupId>
+            <artifactId>jt400</artifactId>
+            <version>21.0.7</version>
+            <scope>provided</scope>
         </dependency>
 
         <!-- MongoDB - Updated to newer version with better ARM64 support -->
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongodb-driver-sync</artifactId>
-            <version>5.5.1</version>
+            <version>5.13.0</version>
         </dependency>
 
         <!-- Add explicit Snappy dependency with ARM64 support -->
         <dependency>
             <groupId>org.xerial.snappy</groupId>
             <artifactId>snappy-java</artifactId>
-            <version>1.1.10.5</version>
+            <version>1.1.10.8</version>
         </dependency>
-
 
         <dependency>
             <groupId>org.apache.orc</groupId>
             <artifactId>orc-core</artifactId>
-            <version>1.6.7</version>
+            <version>2.3.1</version>
         </dependency>
 
         <dependency>
             <groupId>org.apache.orc</groupId>
             <artifactId>orc-mapreduce</artifactId>
-            <version>1.6.7</version>
+            <version>2.3.1</version>
         </dependency>
 
         <dependency>
             <groupId>org.apache.orc</groupId>
             <artifactId>orc-tools</artifactId>
-            <version>1.6.7</version>
+            <version>2.3.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.hive</groupId>
+            <artifactId>hive-storage-api</artifactId>
+            <version>2.8.1</version>
         </dependency>
 
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
-            <version>3.3.2</version>
+            <version>3.5.0</version>
+            <exclusions>
+                <!-- Exclude SLF4J bindings to avoid conflict with log4j-slf4j-impl -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-reload4j</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>ch.qos.reload4j</groupId>
+                    <artifactId>reload4j</artifactId>
+                </exclusion>
+                <!-- Exclude logback to avoid multiple SLF4J bindings -->
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-classic</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-core</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>
-            <version>32.1.3-jre</version>
+            <version>33.7.1-jre</version>
         </dependency>
 
 <!--        <dependency>-->
@@ -335,7 +400,7 @@
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
-            <version>2.8.9</version>
+            <version>2.14.0</version>
         </dependency>
 
     </dependencies>
@@ -346,36 +411,46 @@
             <plugins>
                 <plugin>
                     <artifactId>maven-clean-plugin</artifactId>
-                    <version>3.0.0</version>
+                    <version>3.5.0</version>
                 </plugin>
 
                 <plugin>
                     <artifactId>maven-resources-plugin</artifactId>
-                    <version>3.0.2</version>
+                    <version>3.5.0</version>
                 </plugin>
                 <plugin>
                     <artifactId>maven-compiler-plugin</artifactId>
-                    <version>3.7.0</version>
+                    <version>3.16.0</version>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
-                    <version>2.22.1</version>
+                    <version>3.6.0</version>
                 </plugin>
                 <plugin>
                     <artifactId>maven-jar-plugin</artifactId>
-                    <version>3.0.2</version>
+                    <version>3.5.0</version>
                 </plugin>
                 <plugin>
                     <artifactId>maven-install-plugin</artifactId>
-                    <version>2.5.2</version>
+                    <version>3.1.4</version>
                 </plugin>
                 <plugin>
                     <artifactId>maven-deploy-plugin</artifactId>
-                    <version>2.8.2</version>
+                    <version>3.1.4</version>
                 </plugin>
             </plugins>
         </pluginManagement>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
     </build>
 
     <profiles>
@@ -387,7 +462,7 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-assembly-plugin</artifactId>
-                        <version>3.3.0</version>
+                        <version>3.8.0</version>
                         <executions>
                             <execution>
                                 <phase>package</phase>
@@ -429,45 +504,6 @@
                                 <configuration>
                                     <outputDirectory>${project.build.directory}/lib</outputDirectory>
                                     <includeScope>runtime</includeScope>
-                                </configuration>
-                            </execution>
-                        </executions>
-                    </plugin>
-                    <plugin>
-                        <!-- Build an executable JAR -->
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-jar-plugin</artifactId>
-                        <configuration>
-                            <archive>
-                                <manifest>
-                                    <addClasspath>true</addClasspath>
-                                    <mainClass>org.replicadb.ReplicaDB</mainClass>
-                                    <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
-                                    <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
-                                </manifest>
-                            </archive>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-
-        <profile>
-            <id>release-no-oracle</id>
-            <build>
-                <plugins>
-                    <plugin>
-                        <artifactId>maven-dependency-plugin</artifactId>
-                        <executions>
-                            <execution>
-                                <phase>install</phase>
-                                <goals>
-                                    <goal>copy-dependencies</goal>
-                                </goals>
-                                <configuration>
-                                    <outputDirectory>${project.build.directory}/lib</outputDirectory>
-                                    <includeScope>runtime</includeScope>
-                                    <excludeGroupIds>com.oracle.ojdbc</excludeGroupIds>
                                 </configuration>
                             </execution>
                         </executions>

@@ -4,15 +4,21 @@ import org.apache.commons.cli.*;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.replicadb.config.CredentialRedactor;
+import org.replicadb.execution.ReplicationExecutionContext;
+import org.replicadb.manager.util.ColumnDescriptor;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
 import java.util.Properties;
 
 public class ToolOptions {
 
     private static final Logger LOG = LogManager.getLogger(ToolOptions.class.getName());
     private static final int DEFAULT_JOBS = 4;
-    private static final int DEFAULT_FETCH_SIZE = 5000;
+    private static final int DEFAULT_FETCH_SIZE = 100;
     private static final String DEFAULT_MODE = ReplicationMode.COMPLETE.getModeText();
 
     private String sourceConnect;
@@ -23,6 +29,8 @@ public class ToolOptions {
     private String sourceWhere;
     private String sourceQuery;
     private String sourceFileFormat;
+    private String incrementalWatermarkColumn;
+    private String incrementalWatermarkValue;
 
     private String sinkConnect;
     private String sinkUser;
@@ -36,6 +44,7 @@ public class ToolOptions {
     private Boolean sinkDisableEscape = false;
     private Boolean sinkDisableIndex = false;
     private Boolean sinkDisableTruncate = false;
+    private Boolean sinkAutoCreate = false;
     private Boolean sinkAnalyze = false;
 
 
@@ -52,12 +61,85 @@ public class ToolOptions {
 
     private Properties sourceConnectionParams;
     private Properties sinkConnectionParams;
+    private AzureAuthenticationOptions sourceAuthentication = new AzureAuthenticationOptions();
+    private AzureAuthenticationOptions sinkAuthentication = new AzureAuthenticationOptions();
     private String sentryDsn;
+
+    private List<ColumnDescriptor> sourceColumnDescriptors;
+    private String[] sourcePrimaryKeys;
+    private List<ReplicationTable> replicationTables = List.of();
+    private final ReplicationExecutionContext executionContext = new ReplicationExecutionContext();
 
     private Options options;
 
     public ToolOptions(String[] args) throws ParseException, IOException {
         checkOptions(args);
+    }
+
+    ToolOptions() {
+    }
+
+    public ToolOptions forReplicationTable(ReplicationTable replicationTable) {
+        Objects.requireNonNull(replicationTable, "replicationTable must not be null");
+
+        ToolOptions copy = new ToolOptions();
+        copy.sourceConnect = sourceConnect;
+        copy.sourceUser = sourceUser;
+        copy.sourcePassword = sourcePassword;
+        copy.sourceTable = replicationTable.sourceTable();
+        copy.sourceColumns = sourceColumns;
+        copy.sourceWhere = sourceWhere;
+        copy.sourceQuery = sourceQuery;
+        copy.sourceFileFormat = sourceFileFormat;
+        // incrementalWatermarkColumn/incrementalWatermarkValue are never copied: validateIncrementalWatermarkOptions()
+        // rejects combining them with replication.table.* entries, so a replication-table copy never needs them.
+        copy.sinkConnect = sinkConnect;
+        copy.sinkUser = sinkUser;
+        copy.sinkPassword = sinkPassword;
+        copy.sinkTable = replicationTable.sinkTable();
+        copy.sinkStagingTable = sinkStagingTable;
+        copy.sinkStagingTableAlias = sinkStagingTableAlias;
+        copy.sinkStagingSchema = sinkStagingSchema;
+        copy.sinkColumns = sinkColumns;
+        copy.sinkFileFormat = sinkFileFormat;
+        copy.sinkDisableEscape = sinkDisableEscape;
+        copy.sinkDisableIndex = sinkDisableIndex;
+        copy.sinkDisableTruncate = sinkDisableTruncate;
+        copy.sinkAutoCreate = sinkAutoCreate;
+        copy.sinkAnalyze = sinkAnalyze;
+        copy.jobs = jobs;
+        copy.fetchSize = fetchSize;
+        copy.bandwidthThrottling = bandwidthThrottling;
+        copy.help = help;
+        copy.version = version;
+        copy.verboseLevel = verboseLevel;
+        copy.quotedIdentifiers = quotedIdentifiers;
+        copy.optionsFile = optionsFile;
+        copy.mode = mode;
+        copy.sourceConnectionParams = copyProperties(sourceConnectionParams);
+        copy.sinkConnectionParams = copyProperties(sinkConnectionParams);
+        copy.sourceAuthentication = new AzureAuthenticationOptions(sourceAuthentication);
+        copy.sinkAuthentication = new AzureAuthenticationOptions(sinkAuthentication);
+        copy.sentryDsn = sentryDsn;
+        copy.sourceColumnDescriptors = sourceColumnDescriptors == null
+                ? null
+                : List.copyOf(sourceColumnDescriptors);
+        copy.sourcePrimaryKeys = sourcePrimaryKeys == null
+                ? null
+                : Arrays.copyOf(sourcePrimaryKeys, sourcePrimaryKeys.length);
+        copy.replicationTables = List.of();
+        copy.options = options;
+        return copy;
+    }
+
+    private static Properties copyProperties(Properties properties) {
+        if (properties == null) {
+            return null;
+        }
+
+        Properties copy = new Properties();
+        copy.putAll(properties);
+        return copy;
     }
 
     private void checkOptions(String[] args) throws ParseException, IOException {
@@ -93,6 +175,51 @@ public class ToolOptions {
                         .build()
         );
 
+                options.addOption(
+                    Option.builder()
+                        .longOpt("source-auth-mode")
+                        .desc("Source Microsoft Entra authentication mode")
+                        .hasArg()
+                        .argName("auth-mode")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("source-auth-principal-id")
+                        .desc("Source Microsoft Entra principal or managed identity client ID")
+                        .hasArg()
+                        .argName("principal-id")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("source-auth-login-hint")
+                        .desc("Source Microsoft Entra interactive login hint")
+                        .hasArg()
+                        .argName("login-hint")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("source-auth-client-certificate")
+                        .desc("Source Microsoft Entra service principal certificate path")
+                        .hasArg()
+                        .argName("certificate-path")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("source-auth-client-key")
+                        .desc("Source Microsoft Entra service principal private key path")
+                        .hasArg()
+                        .argName("key-path")
+                        .build()
+                );
+
         options.addOption(
                 Option.builder()
                         .longOpt("source-table")
@@ -117,6 +244,24 @@ public class ToolOptions {
                         .desc("Source database WHERE clause to use during extraction")
                         .hasArg()
                         .argName("where clause")
+                        .build()
+        );
+
+        options.addOption(
+                Option.builder()
+                        .longOpt("incremental-watermark-column")
+                        .desc("Source database column to use as the incremental watermark. Only valid with --mode incremental.")
+                        .hasArg()
+                        .argName("column-name")
+                        .build()
+        );
+
+        options.addOption(
+                Option.builder()
+                        .longOpt("incremental-watermark-value")
+                        .desc("Last committed watermark value; rows with a watermark column value greater than this are replicated. Absent on the first run replicates everything.")
+                        .hasArg()
+                        .argName("value")
                         .build()
         );
 
@@ -167,6 +312,51 @@ public class ToolOptions {
                         .build()
         );
 
+                options.addOption(
+                    Option.builder()
+                        .longOpt("sink-auth-mode")
+                        .desc("Sink Microsoft Entra authentication mode")
+                        .hasArg()
+                        .argName("auth-mode")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("sink-auth-principal-id")
+                        .desc("Sink Microsoft Entra principal or managed identity client ID")
+                        .hasArg()
+                        .argName("principal-id")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("sink-auth-login-hint")
+                        .desc("Sink Microsoft Entra interactive login hint")
+                        .hasArg()
+                        .argName("login-hint")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("sink-auth-client-certificate")
+                        .desc("Sink Microsoft Entra service principal certificate path")
+                        .hasArg()
+                        .argName("certificate-path")
+                        .build()
+                );
+
+                options.addOption(
+                    Option.builder()
+                        .longOpt("sink-auth-client-key")
+                        .desc("Sink Microsoft Entra service principal private key path")
+                        .hasArg()
+                        .argName("key-path")
+                        .build()
+                );
+
         options.addOption(
                 Option.builder()
                         .longOpt("sink-table")
@@ -204,6 +394,13 @@ public class ToolOptions {
                 Option.builder()
                         .longOpt("sink-disable-truncate")
                         .desc("Disable the truncation of the sink database table before populate.")
+                        .build()
+        );
+
+        options.addOption(
+                Option.builder()
+                        .longOpt("sink-auto-create")
+                        .desc("Automatically create the sink table if it does not exist.")
                         .build()
         );
 
@@ -340,6 +537,7 @@ public class ToolOptions {
             if (line.hasOption("sink-disable-index")) setSinkDisableIndexNotNull(true);
             if (line.hasOption("sink-disable-escape")) setSinkDisableEscapeNotNull(true);
             if (line.hasOption("sink-disable-truncate")) setSinkDisableTruncateNotNull(true);
+            if (line.hasOption("sink-auto-create")) setSinkAutoCreateNotNull(true);
             if (line.hasOption("sink-analyze")) setSinkAnalyzeNotNull(true);
             if (line.hasOption("quoted-identifiers")) setQuotedIdentifiers(true);
 
@@ -348,15 +546,27 @@ public class ToolOptions {
             setSinkConnectNotNull(line.getOptionValue("sink-connect"));
             setHelp(line.hasOption("help"));
             setSinkPasswordNotNull(line.getOptionValue("sink-password"));
+            setSinkAuthModeNotNull(line.getOptionValue("sink-auth-mode"));
+            setSinkAuthPrincipalIdNotNull(line.getOptionValue("sink-auth-principal-id"));
+            setSinkAuthLoginHintNotNull(line.getOptionValue("sink-auth-login-hint"));
+            setSinkAuthClientCertificateNotNull(line.getOptionValue("sink-auth-client-certificate"));
+            setSinkAuthClientKeyNotNull(line.getOptionValue("sink-auth-client-key"));
             setSinkTableNotNull(line.getOptionValue("sink-table"));
             setSinkUserNotNull(line.getOptionValue("sink-user"));
             setSourceColumnsNotNull(line.getOptionValue("source-columns"));
             setSourceConnectNotNull(line.getOptionValue("source-connect"));
             setSourcePasswordNotNull(line.getOptionValue("source-password"));
+            setSourceAuthModeNotNull(line.getOptionValue("source-auth-mode"));
+            setSourceAuthPrincipalIdNotNull(line.getOptionValue("source-auth-principal-id"));
+            setSourceAuthLoginHintNotNull(line.getOptionValue("source-auth-login-hint"));
+            setSourceAuthClientCertificateNotNull(line.getOptionValue("source-auth-client-certificate"));
+            setSourceAuthClientKeyNotNull(line.getOptionValue("source-auth-client-key"));
             setSourceQueryNotNull(line.getOptionValue("source-query"));
             setSourceTableNotNull(line.getOptionValue("source-table"));
             setSourceUserNotNull(line.getOptionValue("source-user"));
             setSourceWhereNotNull(line.getOptionValue("source-where"));
+            setIncrementalWatermarkColumnNotNull(line.getOptionValue("incremental-watermark-column"));
+            setIncrementalWatermarkValueNotNull(line.getOptionValue("incremental-watermark-value"));
             setJobsNotNull(line.getOptionValue("jobs"));
             setFetchSizeNotNull(line.getOptionValue("fetch-size"));
             setBandwidthThrottlingNotNull(line.getOptionValue("bandwidth-throttling"));
@@ -365,6 +575,9 @@ public class ToolOptions {
             setSinkStagingTableAliasNotNull(line.getOptionValue("sink-staging-table-alias"));
             setSourceFileFormatNotNull(line.getOptionValue("source-file-format"));
             setSinkFileFormatNotNull(line.getOptionValue("sink-file-format"));
+
+            validateReplicationTableOptions(line);
+            validateIncrementalWatermarkOptions();
 
             //Check for required values
             if (!checkRequiredValues()) throw new IllegalArgumentException("Missing any of the required parameters:" +
@@ -420,6 +633,49 @@ public class ToolOptions {
         return false;
     }
 
+    private void validateReplicationTableOptions(CommandLine line) {
+        if (!hasReplicationTables()) {
+            return;
+        }
+
+        if (hasValue(sourceQuery)) {
+            throw new IllegalArgumentException("source.query cannot be used with replication.table.* entries.");
+        }
+        if (hasValue(sourceTable) || hasValue(sinkTable)) {
+            throw new IllegalArgumentException(
+                    "source.table and sink.table cannot be used with replication.table.* entries.");
+        }
+        if (line.hasOption("source-table") || line.hasOption("sink-table")) {
+            throw new IllegalArgumentException(
+                    "--source-table and --sink-table cannot be used with replication.table.* entries.");
+        }
+        if (ReplicationMode.INCREMENTAL.getModeText().equals(mode)
+                || ReplicationMode.COMPLETE_ATOMIC.getModeText().equals(mode)) {
+            if (hasValue(sinkStagingTable) || hasValue(sinkStagingTableAlias)) {
+                throw new IllegalArgumentException(
+                        "Fixed sink staging tables are not supported with replication.table.* entries; "
+                                + "configure sink.staging.schema instead.");
+            }
+        }
+    }
+
+    private void validateIncrementalWatermarkOptions() {
+        if (hasValue(incrementalWatermarkValue) && !hasValue(incrementalWatermarkColumn)) {
+            throw new IllegalArgumentException(
+                    "incremental-watermark-value cannot be used without incremental-watermark-column.");
+        }
+        if (hasValue(incrementalWatermarkColumn)) {
+            if (!ReplicationMode.INCREMENTAL.getModeText().equals(mode)) {
+                throw new IllegalArgumentException(
+                        "incremental-watermark-column is only supported with --mode incremental.");
+            }
+            if (hasReplicationTables()) {
+                throw new IllegalArgumentException(
+                        "incremental-watermark-column cannot be used with replication.table.* entries.");
+            }
+        }
+    }
+
     public String getVersion() {
         return ToolOptions.class.getPackage().getImplementationVersion();
     }
@@ -458,8 +714,14 @@ public class ToolOptions {
         setSinkDisableIndex(Boolean.parseBoolean(prop.getProperty("sink.disable.index")));
         setSinkDisableEscape(Boolean.parseBoolean(prop.getProperty("sink.disable.escape")));
         setSinkDisableTruncate(Boolean.parseBoolean(prop.getProperty("sink.disable.truncate")));
+        setSinkAutoCreate(Boolean.parseBoolean(prop.getProperty("sink.auto.create")));
         setSinkUser(prop.getProperty("sink.user"));
         setSinkPassword(prop.getProperty("sink.password"));
+        setSinkAuthMode(prop.getProperty("sink.auth.mode"));
+        setSinkAuthPrincipalId(prop.getProperty("sink.auth.principal.id"));
+        setSinkAuthLoginHint(prop.getProperty("sink.auth.login.hint"));
+        setSinkAuthClientCertificate(prop.getProperty("sink.auth.client.certificate"));
+        setSinkAuthClientKey(prop.getProperty("sink.auth.client.key"));
         setSinkTable(prop.getProperty("sink.table"));
         setSinkStagingTable(prop.getProperty("sink.staging.table"));
         setSinkStagingTableAlias(prop.getProperty("sink.staging.table.alias"));
@@ -467,10 +729,17 @@ public class ToolOptions {
         setSourceColumns(prop.getProperty("source.columns"));
         setSourceConnect(prop.getProperty("source.connect"));
         setSourcePassword(prop.getProperty("source.password"));
+        setSourceAuthMode(prop.getProperty("source.auth.mode"));
+        setSourceAuthPrincipalId(prop.getProperty("source.auth.principal.id"));
+        setSourceAuthLoginHint(prop.getProperty("source.auth.login.hint"));
+        setSourceAuthClientCertificate(prop.getProperty("source.auth.client.certificate"));
+        setSourceAuthClientKey(prop.getProperty("source.auth.client.key"));
         setSourceQuery(prop.getProperty("source.query"));
         setSourceTable(prop.getProperty("source.table"));
         setSourceUser(prop.getProperty("source.user"));
         setSourceWhere(prop.getProperty("source.where"));
+        setIncrementalWatermarkColumn(prop.getProperty("incremental.watermark.column"));
+        setIncrementalWatermarkValue(prop.getProperty("incremental.watermark.value"));
         setJobs(prop.getProperty("jobs"));
         setFetchSize(prop.getProperty("fetch.size"));
         setBandwidthThrottling(prop.getProperty("bandwidth.throttling"));
@@ -478,6 +747,7 @@ public class ToolOptions {
         setSourceFileFormat(prop.getProperty("source.file.format"));
         setSinkFileFormat(prop.getProperty("sink.file.format"));
         setSentryDsn(prop.getProperty("sentry.dsn"));
+        setReplicationTables(of.getReplicationTables());
 
         // Connection params
         setSinkConnectionParams(of.getSinkConnectionParams());
@@ -489,6 +759,10 @@ public class ToolOptions {
      */
     public String getSourceConnect() {
         return sourceConnect;
+    }
+
+    public ReplicationExecutionContext getExecutionContext() {
+        return executionContext;
     }
 
     public void setSourceConnect(String sourceConnect) {
@@ -511,6 +785,51 @@ public class ToolOptions {
     public void setSourceUserNotNull(String sourceUser) {
         if (sourceUser != null && !sourceUser.isEmpty())
             this.sourceUser = sourceUser;
+    }
+
+    public void setSourceAuthMode(String mode) {
+        sourceAuthentication.setMode(mode);
+    }
+
+    public void setSourceAuthModeNotNull(String mode) {
+        if (mode != null && !mode.isEmpty())
+            setSourceAuthMode(mode);
+    }
+
+    public void setSourceAuthPrincipalId(String principalId) {
+        sourceAuthentication.setPrincipalId(principalId);
+    }
+
+    public void setSourceAuthPrincipalIdNotNull(String principalId) {
+        if (principalId != null && !principalId.isEmpty())
+            setSourceAuthPrincipalId(principalId);
+    }
+
+    public void setSourceAuthLoginHint(String loginHint) {
+        sourceAuthentication.setLoginHint(loginHint);
+    }
+
+    public void setSourceAuthLoginHintNotNull(String loginHint) {
+        if (loginHint != null && !loginHint.isEmpty())
+            setSourceAuthLoginHint(loginHint);
+    }
+
+    public void setSourceAuthClientCertificate(String clientCertificate) {
+        sourceAuthentication.setClientCertificate(clientCertificate);
+    }
+
+    public void setSourceAuthClientCertificateNotNull(String clientCertificate) {
+        if (clientCertificate != null && !clientCertificate.isEmpty())
+            setSourceAuthClientCertificate(clientCertificate);
+    }
+
+    public void setSourceAuthClientKey(String clientKey) {
+        sourceAuthentication.setClientKey(clientKey);
+    }
+
+    public void setSourceAuthClientKeyNotNull(String clientKey) {
+        if (clientKey != null && !clientKey.isEmpty())
+            setSourceAuthClientKey(clientKey);
     }
 
     public String getSourcePassword() {
@@ -565,6 +884,32 @@ public class ToolOptions {
             this.sourceWhere = sourceWhere;
     }
 
+    public String getIncrementalWatermarkColumn() {
+        return incrementalWatermarkColumn;
+    }
+
+    public void setIncrementalWatermarkColumn(String incrementalWatermarkColumn) {
+        this.incrementalWatermarkColumn = incrementalWatermarkColumn;
+    }
+
+    public void setIncrementalWatermarkColumnNotNull(String incrementalWatermarkColumn) {
+        if (incrementalWatermarkColumn != null && !incrementalWatermarkColumn.isEmpty())
+            this.incrementalWatermarkColumn = incrementalWatermarkColumn;
+    }
+
+    public String getIncrementalWatermarkValue() {
+        return incrementalWatermarkValue;
+    }
+
+    public void setIncrementalWatermarkValue(String incrementalWatermarkValue) {
+        this.incrementalWatermarkValue = incrementalWatermarkValue;
+    }
+
+    public void setIncrementalWatermarkValueNotNull(String incrementalWatermarkValue) {
+        if (incrementalWatermarkValue != null && !incrementalWatermarkValue.isEmpty())
+            this.incrementalWatermarkValue = incrementalWatermarkValue;
+    }
+
     public String getSourceQuery() {
         return sourceQuery;
     }
@@ -602,6 +947,51 @@ public class ToolOptions {
     public void setSinkUserNotNull(String sinkUser) {
         if (sinkUser != null && !sinkUser.isEmpty())
             this.sinkUser = sinkUser;
+    }
+
+    public void setSinkAuthMode(String mode) {
+        sinkAuthentication.setMode(mode);
+    }
+
+    public void setSinkAuthModeNotNull(String mode) {
+        if (mode != null && !mode.isEmpty())
+            setSinkAuthMode(mode);
+    }
+
+    public void setSinkAuthPrincipalId(String principalId) {
+        sinkAuthentication.setPrincipalId(principalId);
+    }
+
+    public void setSinkAuthPrincipalIdNotNull(String principalId) {
+        if (principalId != null && !principalId.isEmpty())
+            setSinkAuthPrincipalId(principalId);
+    }
+
+    public void setSinkAuthLoginHint(String loginHint) {
+        sinkAuthentication.setLoginHint(loginHint);
+    }
+
+    public void setSinkAuthLoginHintNotNull(String loginHint) {
+        if (loginHint != null && !loginHint.isEmpty())
+            setSinkAuthLoginHint(loginHint);
+    }
+
+    public void setSinkAuthClientCertificate(String clientCertificate) {
+        sinkAuthentication.setClientCertificate(clientCertificate);
+    }
+
+    public void setSinkAuthClientCertificateNotNull(String clientCertificate) {
+        if (clientCertificate != null && !clientCertificate.isEmpty())
+            setSinkAuthClientCertificate(clientCertificate);
+    }
+
+    public void setSinkAuthClientKey(String clientKey) {
+        sinkAuthentication.setClientKey(clientKey);
+    }
+
+    public void setSinkAuthClientKeyNotNull(String clientKey) {
+        if (clientKey != null && !clientKey.isEmpty())
+            setSinkAuthClientKey(clientKey);
     }
 
     public String getSinkPassword() {
@@ -761,6 +1151,19 @@ public class ToolOptions {
             this.sinkDisableTruncate = sinkDisableTruncate;
     }
 
+    public Boolean isSinkAutoCreate() {
+        return sinkAutoCreate;
+    }
+
+    public void setSinkAutoCreate(Boolean sinkAutoCreate) {
+        this.sinkAutoCreate = sinkAutoCreate;
+    }
+
+    private void setSinkAutoCreateNotNull(Boolean sinkAutoCreate) {
+        if (sinkAutoCreate != null)
+            this.sinkAutoCreate = sinkAutoCreate;
+    }
+
 
     public Boolean getSinkAnalyze() {
         return sinkAnalyze;
@@ -789,6 +1192,45 @@ public class ToolOptions {
 
     public void setSinkConnectionParams(Properties sinkConnectionParams) {
         this.sinkConnectionParams = sinkConnectionParams;
+    }
+
+    public AzureAuthenticationOptions getSourceAuthentication() {
+        return sourceAuthentication;
+    }
+
+    public void setSourceAuthentication(AzureAuthenticationOptions sourceAuthentication) {
+        this.sourceAuthentication = sourceAuthentication == null
+                ? new AzureAuthenticationOptions()
+                : sourceAuthentication;
+    }
+
+    public AzureAuthenticationOptions getSinkAuthentication() {
+        return sinkAuthentication;
+    }
+
+    public void setSinkAuthentication(AzureAuthenticationOptions sinkAuthentication) {
+        this.sinkAuthentication = sinkAuthentication == null
+                ? new AzureAuthenticationOptions()
+                : sinkAuthentication;
+    }
+
+    public void validateAzureAuthentication() {
+        sourceAuthentication.validate(hasValue(sourceUser), hasValue(sourcePassword));
+        sinkAuthentication.validate(hasValue(sinkUser), hasValue(sinkPassword));
+
+        if (jobs > 1 && (isInteractive(sourceAuthentication) || isInteractive(sinkAuthentication))) {
+            throw new IllegalArgumentException(
+                    "ActiveDirectoryInteractive authentication requires jobs=1 to avoid concurrent browser flows.");
+        }
+    }
+
+    private boolean isInteractive(AzureAuthenticationOptions authentication) {
+        return authentication != null
+                && AzureAuthenticationMode.ACTIVE_DIRECTORY_INTERACTIVE.equals(authentication.getMode());
+    }
+
+    private boolean hasValue(String value) {
+        return value != null && !value.isBlank();
     }
 
 
@@ -857,15 +1299,15 @@ public class ToolOptions {
     @Override
     public String toString() {
         return "ToolOptions{" +
-                " \n\tsourceConnect='" + sourceConnect + '\'' +
-                ",\n\tsourceUser='" + sourceUser + '\'' +
+            " \n\tsourceConnect='" + CredentialRedactor.redactConnectionString(sourceConnect) + '\'' +
+            ",\n\tsourceUser='" + CredentialRedactor.redactIdentity(sourceUser) + '\'' +
                 ",\n\tsourcePassword='" + (sourcePassword != null ? "****" : "null") + '\'' +
                 ",\n\tsourceTable='" + sourceTable + '\'' +
                 ",\n\tsourceColumns='" + sourceColumns + '\'' +
                 ",\n\tsourceWhere='" + sourceWhere + '\'' +
                 ",\n\tsourceQuery='" + sourceQuery + '\'' +
-                ",\n\tsinkConnect='" + sinkConnect + '\'' +
-                ",\n\tsinkUser='" + sinkUser + '\'' +
+                ",\n\tsinkConnect='" + CredentialRedactor.redactConnectionString(sinkConnect) + '\'' +
+                ",\n\tsinkUser='" + CredentialRedactor.redactIdentity(sinkUser) + '\'' +
                 ",\n\tsinkPassword='" + (sinkPassword != null ? "****" : "null") + '\'' +
                 ",\n\tsinkTable='" + sinkTable + '\'' +
                 ",\n\tsinkStagingTable='" + sinkStagingTable + '\'' +
@@ -875,6 +1317,7 @@ public class ToolOptions {
                 ",\n\tsinkDisableEscape=" + sinkDisableEscape +
                 ",\n\tsinkDisableIndex=" + sinkDisableIndex +
                 ",\n\tsinkDisableTruncate=" + sinkDisableTruncate +
+                ",\n\tsinkAutoCreate=" + sinkAutoCreate +
                 ",\n\tsinkAnalyze=" + sinkAnalyze +
                 ",\n\tjobs=" + jobs +
                 ",\n\tBandwidthThrottling=" + bandwidthThrottling +
@@ -885,9 +1328,11 @@ public class ToolOptions {
                 ",\n\tverbose=" + verboseLevel +
                 ",\n\toptionsFile='" + optionsFile + '\'' +
                 ",\n\tmode='" + mode + '\'' +
-                ",\n\tsentryDsn='" + sentryDsn + '\'' +
-                ",\n\tsourceConnectionParams=" + sourceConnectionParams +
-                ",\n\tsinkConnectionParams=" + sinkConnectionParams +
+                ",\n\tsentryDsn='" + CredentialRedactor.redactIdentity(sentryDsn) + '\'' +
+                ",\n\tsourceConnectionParams=" + CredentialRedactor.redactProperties(sourceConnectionParams) +
+                ",\n\tsinkConnectionParams=" + CredentialRedactor.redactProperties(sinkConnectionParams) +
+                ",\n\tsourceAuthentication=" + sourceAuthentication +
+                ",\n\tsinkAuthentication=" + sinkAuthentication +
                 ",\n\tsourceFileFormat='" + sourceFileFormat + '\'' +
                 ",\n\tsinkFileformat='" + sinkFileFormat + '\'' +
                 '}';
@@ -955,6 +1400,34 @@ public class ToolOptions {
 
     public void setSentryDsn(String sentryDsn) {
         this.sentryDsn = sentryDsn;
+    }
+
+    public List<ColumnDescriptor> getSourceColumnDescriptors() {
+        return sourceColumnDescriptors;
+    }
+
+    public void setSourceColumnDescriptors(List<ColumnDescriptor> sourceColumnDescriptors) {
+        this.sourceColumnDescriptors = sourceColumnDescriptors;
+    }
+
+    public String[] getSourcePrimaryKeys() {
+        return sourcePrimaryKeys;
+    }
+
+    public void setSourcePrimaryKeys(String[] sourcePrimaryKeys) {
+        this.sourcePrimaryKeys = sourcePrimaryKeys;
+    }
+
+    public List<ReplicationTable> getReplicationTables() {
+        return replicationTables;
+    }
+
+    public boolean hasReplicationTables() {
+        return !replicationTables.isEmpty();
+    }
+
+    private void setReplicationTables(List<ReplicationTable> replicationTables) {
+        this.replicationTables = replicationTables == null ? List.of() : List.copyOf(replicationTables);
     }
 
 }

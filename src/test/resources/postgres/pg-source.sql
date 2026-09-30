@@ -58,6 +58,8 @@ create table if not exists t_source
 );
 
 truncate table t_source;;
+-- Reset the serial sequence to ensure c_integer starts at 1
+ALTER SEQUENCE t_source_c_integer_seq RESTART WITH 1;
 
 insert into t_source (
     /*C_INTEGER, auto incremented*/
@@ -109,9 +111,9 @@ select
     current_timestamp as C_TIMESTAMP_WITHOUT_TIMEZONE,
     current_time at time zone 'cet' as C_TIME_WITH_TIMEZONE,
     current_timestamp at time zone 'cet' as C_TIMESTAMP_WITH_TIMEZONE,
-    ARRAY [(generate_series * random())::text,(generate_series * random())::text],
+    ARRAY [(generate_series * random())::integer::text,(generate_series * random())::integer::text],
     ARRAY [[(generate_series * random())::int,(generate_series * random())::int],[(generate_series * random())::int,(generate_series * random())::int]],
-    ('<person><age>'||(generate_series * random())::integer||'</age><firstName>'||(generate_series * random())::text||'</firstName><lastName>'||(generate_series * random())::text||'</lastName></person>')::xml,
+    ('<person><age>'||(generate_series * random())::integer||'</age><firstName>'||(generate_series * random())::integer||'</firstName><lastName>'||(generate_series * random())::integer||'</lastName></person>')::xml,
     ('{"firstName": "'||(generate_series * random())::integer||'",  "lastName": "'||(generate_series * random())::integer||'",  "age": '||(generate_series * random())::integer||'}')::jsonb
 from generate_series_4k;
 

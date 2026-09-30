@@ -1,0 +1,50 @@
+spring:
+  datasource:
+    url: ${DB_URL:}
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
+  flyway:
+    enabled: true
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: never
+    properties:
+      org.quartz.scheduler.instanceName: ReplicaDbScheduler
+      org.quartz.scheduler.instanceId: AUTO
+      org.quartz.threadPool.threadCount: 2
+      org.quartz.jobStore.class: org.springframework.scheduling.quartz.LocalDataSourceJobStore
+      org.quartz.jobStore.driverDelegateClass: org.quartz.impl.jdbcjobstore.PostgreSQLDelegate
+      org.quartz.jobStore.tablePrefix: QRTZ_
+      org.quartz.jobStore.isClustered: true
+      org.quartz.jobStore.clusterCheckinInterval: 15000
+      org.quartz.jobStore.misfireThreshold: 60000
+  session:
+    store-type: jdbc
+    jdbc:
+      initialize-schema: never
+    timeout: 30m
+server:
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        secure: true
+        same-site: lax
+management:
+  endpoint:
+    health:
+      show-details: when_authorized
+      group:
+        readiness:
+          include: readinessState,controlPlane,quartz,runQueue
+          show-components: always
+replicadb:
+  security:
+    bootstrap:
+      enabled: false
+  server:
+    execution:
+      pool-size: 4
+    scheduler:
+      checkin-stale-factor: 3

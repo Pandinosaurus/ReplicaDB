@@ -88,6 +88,25 @@ public class CsvCachedRowSetImpl extends StreamingRowSetImpl {
       }
       this.fetchSize = rows;
    }
+
+   /**
+    * Override setMaxRows to avoid validation issues with BaseRowSet.
+    * When maxRows is 0 (unlimited), we don't validate against fetchSize.
+    */
+   @Override
+   public void setMaxRows(int max) throws SQLException {
+      // Call parent to set the value, but catch validation exceptions when max=0
+      if (max == 0) {
+         // Temporarily set fetchSize to 0 to avoid validation error
+         int currentFetchSize = this.fetchSize;
+         this.fetchSize = 0;
+         super.setMaxRows(max);
+         this.fetchSize = currentFetchSize;
+      } else {
+         super.setMaxRows(max);
+      }
+   }
+
    @Override
    public void execute () throws SQLException {
 
@@ -232,7 +251,6 @@ public class CsvCachedRowSetImpl extends StreamingRowSetImpl {
       CSVRecord record;
 
       // Load CSV records into the rowset using direct row appending (like MongoDB)
-      int loadedCount = 0;
       for (int i = 1; i <= currentFetchSize && hasMoreRecords(); i++) {
          lineNumber++;
          try {
@@ -296,7 +314,7 @@ public class CsvCachedRowSetImpl extends StreamingRowSetImpl {
                // Add row to the RowSet (this is the key fix!)
                this.appendRow(rowData);
                this.incrementRowCount();
-               loadedCount++;
+
          } catch (Exception e) {
             LOG.error("CSV error processing record {}: {}", lineNumber, e.getMessage(), e);
             throw new SQLException(e);
@@ -310,23 +328,6 @@ public class CsvCachedRowSetImpl extends StreamingRowSetImpl {
       } else {
          this.beforeFirst(); // No data, position before first
       }
-   }
-
-   /**
-    * Parses the string argument as a boolean. The boolean returned represents the value true if the
-    * string argument is not null and is equal, ignoring case, to the string "true", "yes", "on",
-    * "1", "t", "y".
-    *
-    * @param s the String containing the booleanvalue
-    * @return representation to be parsed
-    */
-   private boolean convertToBoolean (String s) {
-      return ("1".equalsIgnoreCase(s)
-          || "yes".equalsIgnoreCase(s)
-          || "true".equalsIgnoreCase(s)
-          || "on".equalsIgnoreCase(s)
-          || "y".equalsIgnoreCase(s)
-          || "t".equalsIgnoreCase(s));
    }
 
    /**

@@ -1,0 +1,176 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-replicadb}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - metadata-data:/var/lib/postgresql/data
+    networks:
+      - control
+
+  api-one:
+    build:
+      context: ./replicadb-server
+      dockerfile: Dockerfile
+      args:
+        SERVER_VERSION: ${REPLICADB_SERVER_VERSION:-1.0.2}
+    environment:
+      SPRING_PROFILES_ACTIVE: api
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-replicadb}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      REPLICADB_SECURITY_BOOTSTRAP_ENABLED: "true"
+      REPLICADB_BOOTSTRAP_ADMIN_USERNAME: ${REPLICADB_BOOTSTRAP_ADMIN_USERNAME:?REPLICADB_BOOTSTRAP_ADMIN_USERNAME must be set}
+      REPLICADB_BOOTSTRAP_ADMIN_PASSWORD: ${REPLICADB_BOOTSTRAP_ADMIN_PASSWORD:?REPLICADB_BOOTSTRAP_ADMIN_PASSWORD must be set}
+      REPLICADB_SERVER_LOCAL_EXECUTION_ENABLED: "false"
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "false"
+    secrets:
+      - replicadb-master-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/actuator/health/liveness >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1::8080"
+    networks:
+      - public
+      - control
+
+  api-two:
+    build:
+      context: ./replicadb-server
+      dockerfile: Dockerfile
+      args:
+        SERVER_VERSION: ${REPLICADB_SERVER_VERSION:-1.0.2}
+    environment:
+      SPRING_PROFILES_ACTIVE: api
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-replicadb}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      REPLICADB_SECURITY_BOOTSTRAP_ENABLED: "true"
+      REPLICADB_BOOTSTRAP_ADMIN_USERNAME: ${REPLICADB_BOOTSTRAP_ADMIN_USERNAME:?REPLICADB_BOOTSTRAP_ADMIN_USERNAME must be set}
+      REPLICADB_BOOTSTRAP_ADMIN_PASSWORD: ${REPLICADB_BOOTSTRAP_ADMIN_PASSWORD:?REPLICADB_BOOTSTRAP_ADMIN_PASSWORD must be set}
+      REPLICADB_SERVER_LOCAL_EXECUTION_ENABLED: "false"
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "false"
+    secrets:
+      - replicadb-master-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/actuator/health/liveness >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1::8080"
+    networks:
+      - public
+      - control
+
+  worker-one:
+    build:
+      context: ./replicadb-server
+      dockerfile: Dockerfile
+      args:
+        SERVER_VERSION: ${REPLICADB_SERVER_VERSION:-1.0.2}
+    environment:
+      SPRING_PROFILES_ACTIVE: worker
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-replicadb}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      REPLICADB_WORKER_IDENTITY: worker-one
+      REPLICADB_WORKER_MAX_CONCURRENT_RUNS: ${REPLICADB_WORKER_ONE_MAX_CONCURRENT_RUNS:-1}
+      REPLICADB_WORKER_ADMISSION_JITTER_MAX: ${REPLICADB_WORKER_ONE_ADMISSION_JITTER_MAX:-100ms}
+      REPLICADB_WORKER_ADMISSION_GENERIC_COOLDOWN: ${REPLICADB_WORKER_ONE_ADMISSION_GENERIC_COOLDOWN:-250ms}
+      REPLICADB_WORKER_ADMISSION_DIRECTED_QUEUE_CAPACITY: ${REPLICADB_WORKER_ONE_ADMISSION_DIRECTED_QUEUE_CAPACITY:-1024}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_ENABLED: ${REPLICADB_WORKER_ONE_ADMISSION_ADAPTIVE_BACKOFF_ENABLED:-true}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_INITIAL_DELAY: ${REPLICADB_WORKER_ONE_ADMISSION_INITIAL_DELAY:-25ms}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_MAX_DELAY: ${REPLICADB_WORKER_ONE_ADMISSION_MAX_DELAY:-2s}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_DECAY_HALF_LIFE: ${REPLICADB_WORKER_ONE_ADMISSION_DECAY_HALF_LIFE:-30s}
+      REPLICADB_WORKER_MANAGEMENT_ADDRESS: 0.0.0.0
+      REPLICADB_WORKER_MANAGEMENT_PORT: ${REPLICADB_WORKER_MANAGEMENT_PORT:-9091}
+      REPLICADB_WORKER_LEASE_DURATION: ${REPLICADB_WORKER_LEASE_DURATION:-5m}
+      REPLICADB_WORKER_HEARTBEAT_INTERVAL: ${REPLICADB_WORKER_HEARTBEAT_INTERVAL:-30s}
+      REPLICADB_WORKER_POLL_INTERVAL: ${REPLICADB_WORKER_POLL_INTERVAL:-30s}
+      REPLICADB_WORKER_POLL_BATCH_SIZE: ${REPLICADB_WORKER_POLL_BATCH_SIZE:-100}
+    secrets:
+      - replicadb-master-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/actuator/health/liveness >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    expose:
+      - "9091"
+    networks:
+      - control
+
+  worker-two:
+    profiles:
+      - multinode
+    build:
+      context: ./replicadb-server
+      dockerfile: Dockerfile
+      args:
+        SERVER_VERSION: ${REPLICADB_SERVER_VERSION:-1.0.2}
+    environment:
+      SPRING_PROFILES_ACTIVE: worker
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-replicadb}
+      DB_USERNAME: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      REPLICADB_WORKER_IDENTITY: worker-two
+      REPLICADB_WORKER_MAX_CONCURRENT_RUNS: ${REPLICADB_WORKER_TWO_MAX_CONCURRENT_RUNS:-1}
+      REPLICADB_WORKER_ADMISSION_JITTER_MAX: ${REPLICADB_WORKER_TWO_ADMISSION_JITTER_MAX:-100ms}
+      REPLICADB_WORKER_ADMISSION_GENERIC_COOLDOWN: ${REPLICADB_WORKER_TWO_ADMISSION_GENERIC_COOLDOWN:-250ms}
+      REPLICADB_WORKER_ADMISSION_DIRECTED_QUEUE_CAPACITY: ${REPLICADB_WORKER_TWO_ADMISSION_DIRECTED_QUEUE_CAPACITY:-1024}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_ENABLED: ${REPLICADB_WORKER_TWO_ADMISSION_ADAPTIVE_BACKOFF_ENABLED:-true}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_INITIAL_DELAY: ${REPLICADB_WORKER_TWO_ADMISSION_INITIAL_DELAY:-25ms}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_MAX_DELAY: ${REPLICADB_WORKER_TWO_ADMISSION_MAX_DELAY:-2s}
+      REPLICADB_WORKER_ADMISSION_ADAPTIVE_BACKOFF_DECAY_HALF_LIFE: ${REPLICADB_WORKER_TWO_ADMISSION_DECAY_HALF_LIFE:-30s}
+      REPLICADB_WORKER_MANAGEMENT_ADDRESS: 0.0.0.0
+      REPLICADB_WORKER_MANAGEMENT_PORT: ${REPLICADB_WORKER_MANAGEMENT_PORT:-9091}
+      REPLICADB_WORKER_LEASE_DURATION: ${REPLICADB_WORKER_LEASE_DURATION:-5m}
+      REPLICADB_WORKER_HEARTBEAT_INTERVAL: ${REPLICADB_WORKER_HEARTBEAT_INTERVAL:-30s}
+      REPLICADB_WORKER_POLL_INTERVAL: ${REPLICADB_WORKER_POLL_INTERVAL:-30s}
+      REPLICADB_WORKER_POLL_BATCH_SIZE: ${REPLICADB_WORKER_POLL_BATCH_SIZE:-100}
+    secrets:
+      - replicadb-master-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/actuator/health/liveness >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    expose:
+      - "9091"
+    networks:
+      - control
+
+volumes:
+  metadata-data:
+
+secrets:
+  replicadb-master-key:
+    file: ${REPLICADB_SECURITY_KEYRING_FILE:-${REPLICADB_SECURITY_MASTER_KEY_FILE:?REPLICADB_SECURITY_KEYRING_FILE or REPLICADB_SECURITY_MASTER_KEY_FILE must point to a keyring file}}
+
+networks:
+  public:
+  control:
+    internal: true

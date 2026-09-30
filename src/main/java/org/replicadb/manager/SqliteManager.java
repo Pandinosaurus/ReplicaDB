@@ -5,10 +5,25 @@ import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.manager.util.BandwidthThrottling;
+import org.replicadb.manager.util.WatermarkBinder;
 
 import java.io.IOException;
 import java.sql.*;
 
+/**
+ * SQLite-specific database manager.
+ * 
+ * <p><b>NULL Handling:</b> Correctly preserves NULL values for all data types by checking
+ * {@code ResultSet.wasNull()} after primitive getters and calling {@code PreparedStatement.setNull()}
+ * when NULL is detected. Prevents silent NULL-to-default-value conversions.</p>
+ * 
+ * <p>SQLite's dynamic typing system requires careful NULL handling to maintain data integrity
+ * during replication. This manager applies the same NULL preservation pattern as OracleManager
+ * and StandardJDBCManager.</p>
+ * 
+ * @see OracleManager For detailed NULL handling pattern documentation
+ * @see <a href="https://github.com/osalvador/ReplicaDB/issues/51">Issue #51</a>
+ */
 public class SqliteManager extends SqlManager {
 
 	private static final Logger LOG = LogManager.getLogger(SqliteManager.class.getName());
@@ -21,6 +36,87 @@ public class SqliteManager extends SqlManager {
 				&& this.options.getMode().equals(ReplicationMode.COMPLETE_ATOMIC.getModeText())) {
 			throw new UnsupportedOperationException(
 					"The complete-atomic mode is not supported in SQLite database as sink.");
+		}
+	}
+
+	/**
+	 * Override to configure SQLite-specific connection settings for improved concurrency.
+	 * Sets busy_timeout to prevent immediate lock failures, and optionally enables
+	 * WAL mode if specified in connection URL.
+	 *
+	 * @return Connection with SQLite pragmas configured
+	 * @throws SQLException if connection or pragma execution fails
+	 */
+	@Override
+	public Connection getConnection() throws SQLException {
+		Connection conn = super.getConnection();
+		if (conn != null && !conn.isClosed()) {
+			try (Statement stmt = conn.createStatement()) {
+				// Set busy timeout to 30 seconds to handle lock contention
+				// SQLite will retry for this duration instead of failing immediately
+				stmt.execute("PRAGMA busy_timeout = 30000");
+				LOG.info("Set SQLite busy_timeout to 30000ms for lock handling");
+				
+				// Enable WAL mode if user explicitly requests it in connection URL
+				// WAL (Write-Ahead Logging) improves concurrency for read-heavy workloads
+				if (shouldEnableWalMode()) {
+					stmt.execute("PRAGMA journal_mode = WAL");
+					LOG.info("Enabled WAL mode for SQLite connection (user-requested)");
+				}
+			} catch (SQLException e) {
+				LOG.warn("Failed to set SQLite PRAGMA settings: " + e.getMessage());
+				// Don't fail connection creation if PRAGMA fails
+				// The connection is still usable, just without optimizations
+			}
+		}
+		return conn;
+	}
+
+	/**
+	 * Check if WAL mode should be enabled based on connection URL parameters.
+	 * Users can enable WAL by adding "journal_mode=wal" to the connection string.
+	 *
+	 * @return true if WAL mode is requested, false otherwise
+	 */
+	private boolean shouldEnableWalMode() {
+		try {
+			String connectStr = (dsType == DataSourceType.SOURCE) ? 
+				options.getSourceConnect() : options.getSinkConnect();
+			return connectStr != null && 
+				   connectStr.toLowerCase().contains("journal_mode=wal");
+		} catch (Exception e) {
+			LOG.debug("Could not check WAL mode setting: " + e.getMessage());
+			return false;
+		}
+	}
+
+	/**
+	 * Override close() to ensure SQLite releases all locks before closing connection.
+	 * Executes WAL checkpoint to flush any pending writes and release locks on the database file.
+	 * This prevents "database is locked" errors when other connections try to access the database
+	 * immediately after this connection closes.
+	 */
+	@Override
+	public void close() throws SQLException {
+		try {
+			Connection conn = this.getConnection();
+			if (conn != null && !conn.isClosed()) {
+				try (Statement stmt = conn.createStatement()) {
+					// Force a WAL checkpoint to flush any pending writes
+					// This releases write locks on the database file
+					stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+					LOG.debug("Executed WAL checkpoint before closing SQLite connection");
+				} catch (SQLException e) {
+					// Log but don't fail close if checkpoint fails
+					// The database might not be in WAL mode, or checkpoint might not be needed
+					LOG.debug("Could not execute WAL checkpoint: " + e.getMessage());
+				}
+			}
+		} catch (SQLException e) {
+			LOG.debug("Error during SQLite connection cleanup: " + e.getMessage());
+		} finally {
+			// Always call parent close() to properly release the connection
+			super.close();
 		}
 	}
 
@@ -55,12 +151,25 @@ public class SqliteManager extends SqlManager {
 
 		}
 
+		Object watermarkBindValue = null;
+		if (this.options.getSourceQuery() == null && this.options.getIncrementalWatermarkColumn() != null
+			&& this.options.getIncrementalWatermarkValue() != null) {
+			watermarkBindValue = WatermarkBinder.convertToBoundValue(this.options.getIncrementalWatermarkValue(),
+				WatermarkBinder.resolveColumnType(this.options.getSourceColumnDescriptors(), this.options.getIncrementalWatermarkColumn()));
+			sqlCmd = sqlCmd + (sqlCmd.contains(" WHERE ") ? " AND " : " WHERE ")
+				+ escapeColName(this.options.getIncrementalWatermarkColumn()) + " > ?";
+		}
+
 		sqlCmd = sqlCmd + " LIMIT ? OFFSET ? ";
 
 		if (this.options.getJobs() == nThread + 1) {
-			return super.execute(sqlCmd, "-1", offset);
+			return watermarkBindValue != null
+				? super.execute(sqlCmd, watermarkBindValue, "-1", offset)
+				: super.execute(sqlCmd, "-1", offset);
 		} else {
-			return super.execute(sqlCmd, chunkSize, offset);
+			return watermarkBindValue != null
+				? super.execute(sqlCmd, watermarkBindValue, chunkSize, offset)
+				: super.execute(sqlCmd, chunkSize, offset);
 		}
 
 	}
@@ -83,7 +192,9 @@ public class SqliteManager extends SqlManager {
 
 		final String sqlCdm = this.getInsertSQLCommand(tableName, allColumns, columnsNumber);
 		final PreparedStatement ps = this.getConnection().prepareStatement(sqlCdm);
+		registerActiveStatement(ps);
 
+		try {
 		final int batchSize = this.options.getFetchSize();
 		int count = 0;
 
@@ -95,6 +206,7 @@ public class SqliteManager extends SqlManager {
 					this.options.getFetchSize(), resultSet);
 
 			do {
+				checkCancellation();
 				bt.acquiere();
 
 				// Get Columns values
@@ -104,61 +216,164 @@ public class SqliteManager extends SqlManager {
 						case Types.VARCHAR :
 						case Types.CHAR :
 						case Types.LONGVARCHAR :
-							ps.setString(i, resultSet.getString(i));
+							String strVal = resultSet.getString(i);
+							if (resultSet.wasNull() || strVal == null) {
+								ps.setNull(i, Types.VARCHAR);
+							} else {
+								ps.setString(i, strVal);
+							}
 							break;
 						case Types.INTEGER :
 						case Types.TINYINT :
 						case Types.SMALLINT :
-							ps.setInt(i, resultSet.getInt(i));
+							int intVal = resultSet.getInt(i);
+							if (resultSet.wasNull()) {
+								ps.setNull(i, Types.INTEGER);
+							} else {
+								ps.setInt(i, intVal);
+							}
 							break;
 						case Types.BIGINT :
 						case Types.NUMERIC :
 						case Types.DECIMAL :
-							ps.setBigDecimal(i, resultSet.getBigDecimal(i));
+							java.math.BigDecimal bdVal = resultSet.getBigDecimal(i);
+							if (resultSet.wasNull() || bdVal == null) {
+								ps.setNull(i, Types.NUMERIC);
+							} else {
+								ps.setBigDecimal(i, bdVal);
+							}
 							break;
 						case Types.DOUBLE :
-							ps.setDouble(i, resultSet.getDouble(i));
+							double doubleVal = resultSet.getDouble(i);
+							if (resultSet.wasNull()) {
+								ps.setNull(i, Types.DOUBLE);
+							} else {
+								ps.setDouble(i, doubleVal);
+							}
 							break;
 						case Types.FLOAT :
-							ps.setFloat(i, resultSet.getFloat(i));
+							float floatVal = resultSet.getFloat(i);
+							if (resultSet.wasNull()) {
+								ps.setNull(i, Types.FLOAT);
+							} else {
+								ps.setFloat(i, floatVal);
+							}
 							break;
 						case Types.DATE :
-							ps.setDate(i, resultSet.getDate(i));
+							java.sql.Date dateVal;
+							try {
+								dateVal = resultSet.getDate(i);
+							} catch (SQLException e) {
+								// sqlite-jdbc may reject TEXT dates without a time component
+								String s = resultSet.getString(i);
+								if (s == null || resultSet.wasNull()) { ps.setNull(i, Types.DATE); break; }
+								dateVal = java.sql.Date.valueOf(s);
+							}
+							if (resultSet.wasNull() || dateVal == null) {
+								ps.setNull(i, Types.DATE);
+							} else {
+								ps.setDate(i, dateVal);
+							}
+							break;
+						case Types.TIME :
+						case Types.TIME_WITH_TIMEZONE :
+							final Time timeData = resultSet.getTime(i);
+							if (timeData != null) {
+								ps.setString(i, timeData.toString());
+							} else {
+								ps.setNull(i, Types.VARCHAR);
+							}
 							break;
 						case Types.TIMESTAMP :
 						case Types.TIMESTAMP_WITH_TIMEZONE :
 						case -101 :
 						case -102 :
-							ps.setTimestamp(i, resultSet.getTimestamp(i));
+							java.sql.Timestamp tsVal;
+							try {
+								tsVal = resultSet.getTimestamp(i);
+							} catch (SQLException e) {
+								// sqlite-jdbc may reject TEXT timestamps without fractional seconds
+								String s = resultSet.getString(i);
+								if (s == null || resultSet.wasNull()) { ps.setNull(i, Types.TIMESTAMP); break; }
+								tsVal = java.sql.Timestamp.valueOf(s);
+							}
+							if (resultSet.wasNull() || tsVal == null) {
+								ps.setNull(i, Types.TIMESTAMP);
+							} else {
+								ps.setTimestamp(i, tsVal);
+							}
 							break;
 						case Types.BINARY :
-							ps.setBytes(i, resultSet.getBytes(i));
+							byte[] bytesVal = resultSet.getBytes(i);
+							if (resultSet.wasNull() || bytesVal == null) {
+								ps.setNull(i, Types.BINARY);
+							} else {
+								ps.setBytes(i, bytesVal);
+							}
 							break;
 						case Types.BLOB :
-							final Blob blobData = resultSet.getBlob(i);
-							if (blobData != null) {
-								ps.setBytes(i, blobData.getBytes(1, (int) blobData.length()));
-								blobData.free();
-							} else
+							// sqlite-jdbc does not implement getBlob(); use getBytes() directly
+							byte[] blobBytes = resultSet.getBytes(i);
+							if (resultSet.wasNull() || blobBytes == null) {
 								ps.setNull(i, Types.BLOB);
+							} else {
+								ps.setBytes(i, blobBytes);
+							}
 							break;
 						case Types.CLOB :
-							final Clob clobData = resultSet.getClob(i);
-							ps.setString(i, this.clobToString(clobData));
-							if (clobData != null)
-								clobData.free();
+							// sqlite-jdbc does not implement getClob(); use getString() directly
+							String clobStr = resultSet.getString(i);
+							if (resultSet.wasNull() || clobStr == null) {
+								ps.setNull(i, Types.CLOB);
+							} else {
+								ps.setString(i, clobStr);
+							}
 							break;
 						case Types.BOOLEAN :
-							ps.setBoolean(i, resultSet.getBoolean(i));
+							boolean boolVal = resultSet.getBoolean(i);
+							if (resultSet.wasNull()) {
+								ps.setNull(i, Types.BOOLEAN);
+							} else {
+								ps.setBoolean(i, boolVal);
+							}
 							break;
 						case Types.NVARCHAR :
-							ps.setNString(i, resultSet.getNString(i));
+						case Types.NCHAR :
+						case Types.LONGNVARCHAR :
+							// SQLite doesn't support setNString, use setString instead
+							String nStrVal = resultSet.getString(i);
+							if (resultSet.wasNull() || nStrVal == null) {
+								ps.setNull(i, Types.VARCHAR);
+							} else {
+								ps.setString(i, nStrVal);
+							}
+							break;
+						case Types.SQLXML :
+							final SQLXML sqlxmlData = resultSet.getSQLXML(i);
+							if (sqlxmlData != null) {
+								ps.setString(i, sqlxmlData.getString());
+								sqlxmlData.free();
+							} else {
+								ps.setNull(i, Types.VARCHAR);
+							}
 							break;
 						case Types.ROWID :
-							ps.setRowId(i, resultSet.getRowId(i));
+							// SQLite doesn't support setRowId, convert to string
+							final RowId rowIdData = resultSet.getRowId(i);
+							if (rowIdData != null) {
+								ps.setString(i, rowIdData.toString());
+							} else {
+								ps.setNull(i, Types.VARCHAR);
+							}
 							break;
 						case Types.STRUCT :
-							ps.setObject(i, resultSet.getObject(i), Types.STRUCT);
+							// SQLite doesn't support STRUCT, convert to string
+							final Object structData = resultSet.getObject(i);
+							if (structData != null) {
+								ps.setString(i, structData.toString());
+							} else {
+								ps.setNull(i, Types.VARCHAR);
+							}
 							break;
 						default :
 							ps.setString(i, resultSet.getString(i));
@@ -177,10 +392,12 @@ public class SqliteManager extends SqlManager {
 		}
 
 		ps.executeBatch(); // insert remaining records
-		ps.close();
-
 		this.getConnection().commit();
 		return totalRows;
+		} finally {
+			unregisterActiveStatement(ps);
+			ps.close();
+		}
 	}
 
 	private String getInsertSQLCommand(String tableName, String allColumns, int columnsNumber) {
@@ -235,7 +452,9 @@ public class SqliteManager extends SqlManager {
 
 	@Override
 	protected void mergeStagingTable() throws SQLException {
+		checkCancellation();
 		final Statement statement = this.getConnection().createStatement();
+		registerActiveStatement(statement);
 
 		try {
 			final String[] pks = this.getSinkPrimaryKeys(this.getSinkTableName());
@@ -263,18 +482,81 @@ public class SqliteManager extends SqlManager {
 
 			LOG.info("Merging staging table and sink table with this command: {}", sql);
 			statement.executeUpdate(sql.toString());
-			statement.close();
 			this.getConnection().commit();
 
 		} catch (final Exception e) {
-			statement.close();
 			this.connection.rollback();
 			throw e;
+		} finally {
+			unregisterActiveStatement(statement);
+			statement.close();
+		}
+	}
+
+	@Override
+	protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+		// SQLite has a very simple type system with flexible type affinity
+		switch (jdbcType) {
+			// All text types map to TEXT
+			case Types.CHAR:
+			case Types.VARCHAR:
+			case Types.LONGVARCHAR:
+			case Types.NCHAR:
+			case Types.NVARCHAR:
+			case Types.LONGNVARCHAR:
+			case Types.CLOB:
+			case Types.NCLOB:
+			case Types.SQLXML:
+			case Types.ROWID:
+				return "TEXT";
+			
+			// All integer types map to INTEGER
+			case Types.TINYINT:
+			case Types.SMALLINT:
+			case Types.INTEGER:
+			case Types.BIGINT:
+			case Types.BOOLEAN:
+			case Types.BIT:
+				return "INTEGER";
+			
+			// Decimal/numeric types map to REAL
+			case Types.DECIMAL:
+			case Types.NUMERIC:
+			case Types.REAL:
+			case Types.FLOAT:
+			case Types.DOUBLE:
+				return "REAL";
+			
+			// Date/time types stored as TEXT (ISO 8601 strings)
+			case Types.DATE:
+			case Types.TIME:
+			case Types.TIME_WITH_TIMEZONE:
+			case Types.TIMESTAMP:
+			case Types.TIMESTAMP_WITH_TIMEZONE:
+				return "TEXT";
+			
+			// Binary types map to BLOB
+			case Types.BINARY:
+			case Types.VARBINARY:
+			case Types.LONGVARBINARY:
+			case Types.BLOB:
+				return "BLOB";
+			
+			default:
+				LOG.warn("Unmapped JDBC type {} for column '{}', defaulting to TEXT", jdbcType, columnName);
+				return "TEXT";
 		}
 	}
 
 	@Override
 	public void preSourceTasks() throws SQLException {
+		// Call parent to probe source metadata if auto-create is enabled
+		try {
+			super.preSourceTasks();
+		} catch (Exception e) {
+			throw new SQLException("Failed to probe source metadata", e);
+		}
+		
 		// Because chunkSize is static it's required to initialize it
 		// when the unit tests are running
 		chunkSize = 0L;

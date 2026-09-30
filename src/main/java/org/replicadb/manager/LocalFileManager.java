@@ -17,7 +17,6 @@ import java.net.URL;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
@@ -67,12 +66,12 @@ public class LocalFileManager extends SqlManager {
     @Override
     public int insertDataToTable(ResultSet resultSet, int taskId) throws Exception {
 
-        // Temporal file name
-        String randomFileUrl = options.getSinkConnect() + ".repdb." + (new Random().nextInt(9000) + 1000);
+        // Temporal file name - use taskId to guarantee uniqueness across parallel jobs
+        String randomFileUrl = options.getSinkConnect() + ".repdb." + taskId + "." + System.nanoTime();
         LOG.info("Temporal file path: {}",randomFileUrl);
 
         // Save the path of temp file
-        FileManager.setTempFilePath(taskId,randomFileUrl);
+        this.fileManager.setTempFilePath(taskId, randomFileUrl);
 
         // Create the OutputStream
         File tempFile = getFileFromPathString(randomFileUrl);
@@ -107,6 +106,11 @@ public class LocalFileManager extends SqlManager {
 
     @Override
     public void postSourceTasks() {/*Not implemented*/}
+
+    @Override
+    protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+        throw new UnsupportedOperationException("Local files do not support SQL DDL. Use --sink-auto-create only with SQL databases.");
+    }
 
     @Override
     public void preSourceTasks() {
@@ -152,6 +156,9 @@ public class LocalFileManager extends SqlManager {
 
         if (uri.getAuthority() != null && uri.getAuthority().length() > 0) {
             // Hack for UNC Path
+            if (urlString == null) {
+                throw new IllegalArgumentException("URL string cannot be null for UNC path conversion");
+            }
             uri = (new URL("file://" + urlString.substring("file:".length()))).toURI();
         }
 

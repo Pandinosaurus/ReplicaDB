@@ -3,6 +3,8 @@ wizard/.idea/*
 .settings/*
 lib/*
 target/*
+replicadb-server/target/*
+replicadb-server/src/main/resources/static/*
 test/*
 sourcetrail_dependencies/*
 ReplicaDB-*.jar
@@ -21,3 +23,12 @@ create_db.log
 create_db_error.log
 .DS_Store
 .vscode
+*.log
+.phase3-compose/
+.phase3-logs/
+.phase3-*.env
+docs/node_modules/
+docs/dist/
+docs/.astro/
+docs/test-results/
+docs/playwright-report/

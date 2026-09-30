@@ -3,7 +3,6 @@ package org.replicadb.mysql;
 import org.apache.commons.cli.ParseException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Rule;
 import org.junit.jupiter.api.*;
 import org.replicadb.ReplicaDB;
 import org.replicadb.cli.ReplicationMode;
@@ -27,14 +26,30 @@ class MySQL2PostgresTest {
     private static final String RESOURCE_DIR = Paths.get("src", "test", "resources").toFile().getAbsolutePath();
     private static final String REPLICADB_CONF_FILE = "/replicadb.conf";
     private static final int EXPECTED_ROWS = 4097;
+    // Binary and floating-point columns now enabled
+    // Note: FLOAT columns use TEXT COPY (no CAST needed), BINARY columns use binary COPY
+    private static final String SINK_COLUMNS = "C_INTEGER,C_SMALLINT,C_BIGINT,C_NUMERIC,C_DECIMAL," +
+            "C_REAL,C_DOUBLE_PRECISION,C_FLOAT," +
+            "C_BOOLEAN," +
+            "C_CHARACTER,C_CHARACTER_VAR,C_CHARACTER_LOB," +
+            "C_NATIONAL_CHARACTER,C_NATIONAL_CHARACTER_VAR," +
+            "C_BINARY,C_BINARY_VAR,C_BINARY_LOB," +
+            "C_DATE,C_TIME_WITHOUT_TIMEZONE,C_TIMESTAMP_WITHOUT_TIMEZONE," +
+            "C_TIME_WITH_TIMEZONE,C_TIMESTAMP_WITH_TIMEZONE";
+    private static final String SOURCE_COLUMNS = "C_INTEGER,C_SMALLINT,C_BIGINT,C_NUMERIC,C_DECIMAL," +
+            "C_REAL,C_DOUBLE_PRECISION,C_FLOAT," +
+            "C_BOOLEAN," +
+            "C_CHARACTER,C_CHARACTER_VAR,C_CHARACTER_LOB," +
+            "C_NATIONAL_CHARACTER,C_NATIONAL_CHARACTER_VAR," +
+            "C_BINARY,C_BINARY_VAR,C_BINARY_LOB," +
+            "C_DATE,C_TIME_WITHOUT_TIMEZONE,C_TIMESTAMP_WITHOUT_TIMEZONE," +
+            "C_TIME_WITH_TIMEZONE,C_TIMESTAMP_WITH_TIMEZONE";
 
     private Connection mysqlConn;
     private Connection postgresConn;
 
-    @Rule
     public static MySQLContainer<ReplicadbMysqlContainer> mysql = ReplicadbMysqlContainer.getInstance();
 
-    @Rule
     public static PostgreSQLContainer<ReplicadbPostgresqlContainer> postgres = ReplicadbPostgresqlContainer.getInstance();
 
     @BeforeAll
@@ -64,6 +79,74 @@ class MySQL2PostgresTest {
         int count = rs.getInt(1);
         LOG.info(count);
         return count;
+    }
+
+    /**
+     * Validate binary and floating-point data integrity between source and sink.
+     * Compares BINARY columns byte-by-byte and FLOAT/DOUBLE with epsilon tolerance.
+     */
+    private void validateBinaryAndFloatData() throws SQLException {
+        String query = "SELECT C_BINARY, C_BINARY_VAR, C_REAL, C_DOUBLE_PRECISION, C_FLOAT " +
+                      "FROM t_source ORDER BY C_INTEGER LIMIT 3";
+        String sinkQuery = "SELECT C_BINARY, C_BINARY_VAR, C_REAL, C_DOUBLE_PRECISION, C_FLOAT " +
+                          "FROM t_sink ORDER BY C_INTEGER LIMIT 3";
+        
+        try (Statement mysqlStmt = mysqlConn.createStatement();
+             Statement pgStmt = postgresConn.createStatement();
+             ResultSet mysqlRs = mysqlStmt.executeQuery(query);
+             ResultSet pgRs = pgStmt.executeQuery(sinkQuery)) {
+            
+            int rowCount = 0;
+            double floatEpsilon = 0.0001;  // Tolerance for FLOAT/REAL
+            double doubleEpsilon = 0.0000001;  // Tolerance for DOUBLE
+            
+            while (mysqlRs.next() && pgRs.next()) {
+                rowCount++;
+                
+                // Validate BINARY columns byte-by-byte
+                byte[] mysqlBinary = mysqlRs.getBytes("C_BINARY");
+                byte[] pgBinary = pgRs.getBytes("C_BINARY");
+                if (mysqlBinary != null && pgBinary != null) {
+                    Assertions.assertArrayEquals(mysqlBinary, pgBinary,
+                        "Row " + rowCount + " C_BINARY mismatch");
+                }
+                
+                byte[] mysqlBinaryVar = mysqlRs.getBytes("C_BINARY_VAR");
+                byte[] pgBinaryVar = pgRs.getBytes("C_BINARY_VAR");
+                if (mysqlBinaryVar != null && pgBinaryVar != null) {
+                    Assertions.assertArrayEquals(mysqlBinaryVar, pgBinaryVar,
+                        "Row " + rowCount + " C_BINARY_VAR mismatch");
+                }
+                
+                // Validate FLOAT values with epsilon tolerance
+                if (!mysqlRs.wasNull() && !pgRs.wasNull()) {
+                    float mysqlReal = mysqlRs.getFloat("C_REAL");
+                    float pgReal = pgRs.getFloat("C_REAL");
+                    assertTrue(Math.abs(mysqlReal - pgReal) < floatEpsilon,
+                        String.format("Row %d C_REAL mismatch. MySQL: %f, PG: %f, diff: %f",
+                            rowCount, mysqlReal, pgReal, Math.abs(mysqlReal - pgReal)));
+                    
+                    float mysqlFloat = mysqlRs.getFloat("C_FLOAT");
+                    float pgFloat = pgRs.getFloat("C_FLOAT");
+                    assertTrue(Math.abs(mysqlFloat - pgFloat) < floatEpsilon,
+                        String.format("Row %d C_FLOAT mismatch. MySQL: %f, PG: %f",
+                            rowCount, mysqlFloat, pgFloat));
+                }
+                
+                // Validate DOUBLE values with epsilon tolerance
+                if (!mysqlRs.wasNull() && !pgRs.wasNull()) {
+                    double mysqlDouble = mysqlRs.getDouble("C_DOUBLE_PRECISION");
+                    double pgDouble = pgRs.getDouble("C_DOUBLE_PRECISION");
+                    assertTrue(Math.abs(mysqlDouble - pgDouble) < doubleEpsilon,
+                        String.format("Row %d C_DOUBLE_PRECISION mismatch. MySQL: %.10f, PG: %.10f",
+                            rowCount, mysqlDouble, pgDouble));
+                }
+                
+                LOG.info("Row {}: Validated - C_BINARY, C_BINARY_VAR, C_REAL, C_DOUBLE_PRECISION, C_FLOAT", rowCount);
+            }
+            
+            assertEquals(3, rowCount, "Should validate 3 sample rows");
+        }
     }
 
 
@@ -105,7 +188,9 @@ class MySQL2PostgresTest {
                 "--source-password", mysql.getPassword(),
                 "--sink-connect", postgres.getJdbcUrl(),
                 "--sink-user", postgres.getUsername(),
-                "--sink-password", postgres.getPassword()
+                "--sink-password", postgres.getPassword(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         Assertions.assertEquals(0, ReplicaDB.processReplica(options));
@@ -122,7 +207,9 @@ class MySQL2PostgresTest {
                 "--sink-connect", postgres.getJdbcUrl(),
                 "--sink-user", postgres.getUsername(),
                 "--sink-password", postgres.getPassword(),
-                "--mode", ReplicationMode.COMPLETE_ATOMIC.getModeText()
+                "--mode", ReplicationMode.COMPLETE_ATOMIC.getModeText(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         assertEquals(0, ReplicaDB.processReplica(options));
@@ -132,6 +219,8 @@ class MySQL2PostgresTest {
 
     @Test
     void testMySQL2PostgresIncremental() throws ParseException, IOException, SQLException {
+        // Note: Incremental mode incompatible with --source-query (overrides WHERE clause)
+        // Using --source-columns instead, which limits columns but allows TEXT COPY for FLOAT
         String[] args = {
                 "--options-file", RESOURCE_DIR + REPLICADB_CONF_FILE,
                 "--source-connect", mysql.getJdbcUrl(),
@@ -140,7 +229,9 @@ class MySQL2PostgresTest {
                 "--sink-connect", postgres.getJdbcUrl(),
                 "--sink-user", postgres.getUsername(),
                 "--sink-password", postgres.getPassword(),
-                "--mode", ReplicationMode.INCREMENTAL.getModeText()
+                "--mode", ReplicationMode.INCREMENTAL.getModeText(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         assertEquals(0, ReplicaDB.processReplica(options));
@@ -158,7 +249,9 @@ class MySQL2PostgresTest {
                 "--sink-connect", postgres.getJdbcUrl(),
                 "--sink-user", postgres.getUsername(),
                 "--sink-password", postgres.getPassword(),
-                "--jobs", "4"
+                "--jobs", "4",
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         assertEquals(0, ReplicaDB.processReplica(options));
@@ -176,7 +269,9 @@ class MySQL2PostgresTest {
                 "--sink-user", postgres.getUsername(),
                 "--sink-password", postgres.getPassword(),
                 "--mode", ReplicationMode.COMPLETE_ATOMIC.getModeText(),
-                "--jobs", "4"
+                "--jobs", "4",
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         assertEquals(0, ReplicaDB.processReplica(options));
@@ -194,10 +289,140 @@ class MySQL2PostgresTest {
                 "--sink-user", postgres.getUsername(),
                 "--sink-password", postgres.getPassword(),
                 "--mode", ReplicationMode.INCREMENTAL.getModeText(),
-                "--jobs", "4"
+                "--jobs", "4",
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-columns", SINK_COLUMNS
         };
         ToolOptions options = new ToolOptions(args);
         assertEquals(0, ReplicaDB.processReplica(options));
         assertEquals(EXPECTED_ROWS, countSinkRows());
+    }
+
+    // Helper methods for auto-create tests
+    private boolean tableExists(Connection conn, String tableName) throws SQLException {
+        DatabaseMetaData meta = conn.getMetaData();
+        try (ResultSet rs = meta.getTables(null, null, tableName.toUpperCase(), new String[]{"TABLE"})) {
+            if (rs.next()) return true;
+        }
+        try (ResultSet rs = meta.getTables(null, null, tableName.toLowerCase(), new String[]{"TABLE"})) {
+            if (rs.next()) return true;
+        }
+        try (ResultSet rs = meta.getTables(null, null, tableName, new String[]{"TABLE"})) {
+            return rs.next();
+        }
+    }
+
+    private int countRows(Connection conn, String tableName) throws SQLException {
+        Statement stmt = conn.createStatement();
+        ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + tableName);
+        rs.next();
+        return rs.getInt(1);
+    }
+
+    @Test
+    void testMySQL2PostgresAutoCreateCompleteMode() throws ParseException, IOException, SQLException {
+        String sinkTable = "t_sink_autocreate_mysql2pg";
+        
+        // Verify table doesn't exist
+        Assertions.assertFalse(tableExists(postgresConn, sinkTable), "Sink table should not exist before test");
+        
+        String[] args = {
+                "--options-file", RESOURCE_DIR + REPLICADB_CONF_FILE,
+                "--source-connect", mysql.getJdbcUrl(),
+                "--source-user", mysql.getUsername(),
+                "--source-password", mysql.getPassword(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-connect", postgres.getJdbcUrl(),
+                "--sink-user", postgres.getUsername(),
+                "--sink-password", postgres.getPassword(),
+                "--sink-table", sinkTable,
+                "--sink-columns", SINK_COLUMNS,
+                "--sink-auto-create", "true",
+                "--mode", ReplicationMode.COMPLETE.getModeText()
+        };
+        ToolOptions options = new ToolOptions(args);
+        assertEquals(0, ReplicaDB.processReplica(options));
+        
+        // Verify table was created and populated
+        assertTrue(tableExists(postgresConn, sinkTable), "Sink table should exist after auto-create");
+        assertEquals(EXPECTED_ROWS, countRows(postgresConn, sinkTable));
+        LOG.info("Successfully replicated {} rows to auto-created PostgreSQL table", EXPECTED_ROWS);
+        
+        // Cleanup
+        postgresConn.createStatement().execute("DROP TABLE " + sinkTable);
+    }
+
+    @Test
+    void testMySQL2PostgresAutoCreateIncrementalMode() throws ParseException, IOException, SQLException {
+        String sinkTable = "t_sink_autocreate_incremental_mysql2pg";
+        
+        // Verify table doesn't exist
+        Assertions.assertFalse(tableExists(postgresConn, sinkTable), "Sink table should not exist before test");
+        
+        String[] args = {
+                "--options-file", RESOURCE_DIR + REPLICADB_CONF_FILE,
+                "--source-connect", mysql.getJdbcUrl(),
+                "--source-user", mysql.getUsername(),
+                "--source-password", mysql.getPassword(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-connect", postgres.getJdbcUrl(),
+                "--sink-user", postgres.getUsername(),
+                "--sink-password", postgres.getPassword(),
+                "--sink-table", sinkTable,
+                "--sink-columns", SINK_COLUMNS,
+                "--sink-auto-create", "true",
+                "--mode", ReplicationMode.INCREMENTAL.getModeText()
+        };
+        ToolOptions options = new ToolOptions(args);
+        assertEquals(0, ReplicaDB.processReplica(options));
+        
+        // Verify table was created with primary key
+        assertTrue(tableExists(postgresConn, sinkTable), "Sink table should exist after auto-create");
+        DatabaseMetaData meta = postgresConn.getMetaData();
+        ResultSet pks = meta.getPrimaryKeys(null, "public", sinkTable);
+        boolean hasResults = pks.next();
+        if (!hasResults) {
+            pks.close();
+            pks = meta.getPrimaryKeys(null, "public", sinkTable.toLowerCase());
+            hasResults = pks.next();
+        }
+        assertTrue(hasResults, "Table should have a primary key");
+        String pkColumn = pks.getString("COLUMN_NAME");
+        LOG.info("Primary key columns: {}", pkColumn);
+        pks.close();
+        assertEquals(EXPECTED_ROWS, countRows(postgresConn, sinkTable));
+        
+        // Run again to test merge functionality
+        assertEquals(0, ReplicaDB.processReplica(options));
+        assertEquals(EXPECTED_ROWS, countRows(postgresConn, sinkTable), "Row count should remain the same after merge");
+        LOG.info("Incremental mode merge successful - row count unchanged: {}", EXPECTED_ROWS);
+        
+        // Cleanup
+        postgresConn.createStatement().execute("DROP TABLE " + sinkTable);
+    }
+
+    @Test
+    void testMySQL2PostgresAutoCreateSkippedWhenTableExists() throws ParseException, IOException, SQLException {
+        // Use existing T_SINK table
+        assertTrue(tableExists(postgresConn, "T_SINK"), "T_SINK table should exist");
+        
+        String[] args = {
+                "--options-file", RESOURCE_DIR + REPLICADB_CONF_FILE,
+                "--source-connect", mysql.getJdbcUrl(),
+                "--source-user", mysql.getUsername(),
+                "--source-password", mysql.getPassword(),
+                "--source-columns", SOURCE_COLUMNS,
+                "--sink-connect", postgres.getJdbcUrl(),
+                "--sink-user", postgres.getUsername(),
+                "--sink-password", postgres.getPassword(),
+                "--sink-table", "T_SINK",
+                "--sink-columns", SINK_COLUMNS,
+                "--sink-auto-create", "true",
+                "--mode", ReplicationMode.COMPLETE.getModeText()
+        };
+        ToolOptions options = new ToolOptions(args);
+        assertEquals(0, ReplicaDB.processReplica(options));
+        assertEquals(EXPECTED_ROWS, countSinkRows());
+        LOG.info("Auto-create correctly skipped for existing table, {} rows replicated", EXPECTED_ROWS);
     }
 }

@@ -8,7 +8,7 @@ public enum SupportedManagers {
     MYSQL(JdbcDrivers.MYSQL.getSchemePrefix()), MARIADB(JdbcDrivers.MARIADB.getSchemePrefix()), POSTGRES(JdbcDrivers.POSTGRES.getSchemePrefix()),
     HSQLDB(JdbcDrivers.HSQLDB.getSchemePrefix()), ORACLE(JdbcDrivers.ORACLE.getSchemePrefix()),
     SQLSERVER(JdbcDrivers.SQLSERVER.getSchemePrefix()), CUBRID(JdbcDrivers.CUBRID.getSchemePrefix()),
-    JTDS_SQLSERVER(JdbcDrivers.JTDS_SQLSERVER.getSchemePrefix()), DB2(JdbcDrivers.DB2.getSchemePrefix()),
+    JTDS_SQLSERVER(JdbcDrivers.JTDS_SQLSERVER.getSchemePrefix()), DB2(JdbcDrivers.DB2.getSchemePrefix()), DB2_AS400(JdbcDrivers.DB2_AS400.getSchemePrefix()),
     NETEZZA(JdbcDrivers.NETEZZA.getSchemePrefix()), DENODO(JdbcDrivers.DENODO.getSchemePrefix()),
     KAFKA(JdbcDrivers.KAFKA.getSchemePrefix()),
     S3(JdbcDrivers.S3.getSchemePrefix()), FILE(JdbcDrivers.FILE.getSchemePrefix()),
@@ -26,6 +26,10 @@ public enum SupportedManagers {
 
     public String getSchemePrefix() {
         return schemePrefix;
+    }
+
+    public ManagerCapabilities getCapabilities() {
+        return ManagerCapabilities.forManager(this);
     }
 
 
@@ -60,6 +64,12 @@ public enum SupportedManagers {
         // however, commonly have a multi-scheme addressing system. e.g.,
         // jdbc:mysql://...; so we cannot parse the scheme component via URL
         // objects. Instead, attempt to pull out the scheme as best as we can.
+
+        // Validate connectStr is not null before processing
+        if (connectStr == null) {
+            LOG.error("Connection string is null for DataSourceType: {}", dsType);
+            return null;
+        }
 
         // First, see if this is of the form [scheme://hostname-and-etc..]
         int schemeStopIdx = connectStr.indexOf("//");

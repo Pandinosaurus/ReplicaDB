@@ -3,15 +3,13 @@ package org.replicadb.mongo;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.apache.commons.cli.ParseException;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.bson.Document;
-import org.junit.Rule;
 import org.junit.jupiter.api.*;
 import org.replicadb.ReplicaDB;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.config.ReplicadbMongodbContainer;
+import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.io.IOException;
@@ -22,7 +20,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @Testcontainers
 class Mongo2MongoTest {
-    private static final Logger LOG = LogManager.getLogger(Mongo2MongoTest.class);
     private static final String RESOURCE_DIR = Paths.get("src", "test", "resources").toFile().getAbsolutePath();
     private static final String REPLICADB_CONF_FILE = "/replicadb.conf";
     private static final int EXPECTED_ROWS = 4096;
@@ -31,12 +28,15 @@ class Mongo2MongoTest {
     private MongoClient mongoClient;
     private String mongoDatabaseName;
 
-    @Rule
-    public static ReplicadbMongodbContainer mongoContainer = ReplicadbMongodbContainer.getInstance();
+    @Container
+    public static final ReplicadbMongodbContainer mongoContainer = ReplicadbMongodbContainer.getInstance();
 
 
     @BeforeAll
     static void setUp(){
+        if (!mongoContainer.isRunning()) {
+            mongoContainer.start();
+        }
     }
 
     @BeforeEach

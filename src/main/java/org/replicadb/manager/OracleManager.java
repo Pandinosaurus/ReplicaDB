@@ -6,18 +6,35 @@ import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.manager.util.BandwidthThrottling;
+import org.replicadb.manager.util.WatermarkBinder;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.Reader;
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
-
+/**
+ * Oracle-specific database manager with optimizations for Oracle Database.
+ * 
+ * <p><b>NULL Handling:</b> This class correctly preserves NULL values for all data types
+ * during replication by checking {@code ResultSet.wasNull()} after calling primitive getters
+ * (getInt, getDouble, getFloat, etc.) and calling {@code PreparedStatement.setNull()} when
+ * NULL is detected. This prevents silent conversion of NULL to default values like 0, 0.0,
+ * false, or epoch dates.</p>
+ * 
+ * <p>Fixes Issue #51: NULL INTEGER values from Denodo were incorrectly converted to 0 in Oracle
+ * sink tables. The fix applies to all primitive and temporal types: INTEGER, BIGINT, DOUBLE,
+ * FLOAT, DATE, TIMESTAMP, VARCHAR, and BINARY.</p>
+ * 
+ * @see <a href="https://github.com/osalvador/ReplicaDB/issues/51">Issue #51</a>
+ */
 public class OracleManager extends SqlManager {
 
     private static final Logger LOG = LogManager.getLogger(OracleManager.class.getName());
+    private Long oracleSourceScn = null;  // SCN for flashback query consistency
 
     public OracleManager(ToolOptions opts, DataSourceType dsType) {
         super(opts);
@@ -40,6 +57,7 @@ public class OracleManager extends SqlManager {
         String allColumns = this.options.getSourceColumns() == null ? "*" : this.options.getSourceColumns();
 
         String sqlCmd;
+        Object watermarkBindValue = null;
 
         // Read table with source-query option specified
         if (options.getSourceQuery() != null && !options.getSourceQuery().isEmpty()) {
@@ -57,6 +75,11 @@ public class OracleManager extends SqlManager {
                     allColumns +
                     " FROM " +
                     escapeTableName(tableName) + " where " + options.getSourceWhere();
+            if (options.getIncrementalWatermarkColumn() != null && options.getIncrementalWatermarkValue() != null) {
+                watermarkBindValue = WatermarkBinder.convertToBoundValue(options.getIncrementalWatermarkValue(),
+                        WatermarkBinder.resolveColumnType(options.getSourceColumnDescriptors(), options.getIncrementalWatermarkColumn()));
+                sqlCmd = sqlCmd + " AND " + escapeColName(options.getIncrementalWatermarkColumn()) + " > ?";
+            }
             if (options.getJobs() == 1)
                 sqlCmd = sqlCmd + " AND 0 = ?";
             else
@@ -69,7 +92,21 @@ public class OracleManager extends SqlManager {
                     " FROM " +
                     escapeTableName(tableName);
 
-            if (options.getJobs() == 1)
+            // Apply flashback query if SCN was captured
+            if (this.oracleSourceScn != null) {
+                sqlCmd += " AS OF SCN " + this.oracleSourceScn;
+                LOG.debug("Using flashback query with SCN {}", this.oracleSourceScn);
+            }
+
+            if (options.getIncrementalWatermarkColumn() != null && options.getIncrementalWatermarkValue() != null) {
+                watermarkBindValue = WatermarkBinder.convertToBoundValue(options.getIncrementalWatermarkValue(),
+                        WatermarkBinder.resolveColumnType(options.getSourceColumnDescriptors(), options.getIncrementalWatermarkColumn()));
+                sqlCmd = sqlCmd + " where " + escapeColName(options.getIncrementalWatermarkColumn()) + " > ?";
+                if (options.getJobs() == 1)
+                    sqlCmd = sqlCmd + " AND 0 = ?";
+                else
+                    sqlCmd = sqlCmd + " AND ora_hash(rowid," + (options.getJobs() - 1) + ") = ?";
+            } else if (options.getJobs() == 1)
                 sqlCmd = sqlCmd + " where 0 = ?";
             else
                 sqlCmd = sqlCmd + " where ora_hash(rowid," + (options.getJobs() - 1) + ") = ?";
@@ -77,7 +114,27 @@ public class OracleManager extends SqlManager {
 
         }
 
-        return super.execute(sqlCmd, (Object) nThread);
+        try {
+            return watermarkBindValue != null
+                    ? super.execute(sqlCmd, watermarkBindValue, (Object) nThread)
+                    : super.execute(sqlCmd, (Object) nThread);
+        } catch (SQLException e) {
+            // Handle flashback-specific errors
+            if (e.getErrorCode() == 8181) {
+                // ORA-08181: specified number is not a valid system change number
+                LOG.error("Flashback query failed: SCN {} is too old (outside undo retention window). " +
+                          "Recommendation: Increase Oracle UNDO_RETENTION parameter or run replication " +
+                          "during lower activity periods.", this.oracleSourceScn);
+                throw e;
+            } else if (e.getErrorCode() == 1555) {
+                // ORA-01555: should not occur with flashback, but defensive check
+                LOG.error("ORA-01555 occurred despite flashback query. This suggests insufficient " +
+                          "undo retention. Current SCN: {}", this.oracleSourceScn);
+                throw e;
+            }
+            // Propagate other SQLExceptions
+            throw e;
+        }
     }
 
     public void oracleAlterSession(Boolean directRead) throws SQLException {
@@ -98,7 +155,35 @@ public class OracleManager extends SqlManager {
         stmt.close();
     }
 
-
+    /**
+     * Inserts data from a ResultSet into the Oracle sink table.
+     * 
+     * <p><b>NULL Handling Pattern:</b> For primitive types (int, double, float, etc.), this method
+     * stores the value first, then checks {@code resultSet.wasNull()} to detect SQL NULL. If NULL
+     * is detected, it calls {@code ps.setNull(columnIndex, sqlType)} instead of setting the primitive
+     * value. This prevents NULL from being silently converted to primitive defaults (0, 0.0, false).</p>
+     * 
+     * <p>Example pattern for INTEGER:</p>
+     * <pre>{@code
+     * case Types.INTEGER:
+     *     int intValue = resultSet.getInt(i);
+     *     if (resultSet.wasNull()) {
+     *         ps.setNull(i, Types.INTEGER);  // Preserve NULL
+     *     } else {
+     *         ps.setInt(i, intValue);        // Set actual value
+     *     }
+     *     break;
+     * }</pre>
+     * 
+     * <p>This pattern is applied consistently for all primitive and temporal types to ensure
+     * data integrity during replication. See Issue #51 for original problem report.</p>
+     * 
+     * @param resultSet The source data to insert
+     * @param taskId The parallel task identifier
+     * @return Number of rows inserted
+     * @throws SQLException If database operation fails
+     * @throws IOException If I/O operation fails
+     */
     @Override
     public int insertDataToTable(ResultSet resultSet, int taskId) throws SQLException, IOException {
 
@@ -118,7 +203,10 @@ public class OracleManager extends SqlManager {
 
         String sqlCdm = getInsertSQLCommand(tableName, allColumns, columnsNumber);
         PreparedStatement ps = this.getConnection().prepareStatement(sqlCdm);
+        registerActiveStatement(ps);
+        List<AutoCloseable> openStreams = new ArrayList<>();
 
+        try {
         final int batchSize = options.getFetchSize();
         int count = 0;
 
@@ -131,6 +219,7 @@ public class OracleManager extends SqlManager {
             BandwidthThrottling bt = new BandwidthThrottling(options.getBandwidthThrottling(), options.getFetchSize(), resultSet);
 
             do {
+                checkCancellation();
                 bt.acquiere();
 
                 // Get Columns values
@@ -140,55 +229,108 @@ public class OracleManager extends SqlManager {
                         case Types.VARCHAR:
                         case Types.CHAR:
                         case Types.LONGVARCHAR:
-                            ps.setString(i, resultSet.getString(i));
+                            String strVal = resultSet.getString(i);
+                            if (resultSet.wasNull() || strVal == null) {
+                                ps.setNull(i, Types.VARCHAR);
+                            } else {
+                                ps.setString(i, strVal);
+                            }
                             break;
                         case Types.INTEGER:
                         case Types.TINYINT:
                         case Types.SMALLINT:
-                            ps.setInt(i, resultSet.getInt(i));
+                            int intVal = resultSet.getInt(i);
+                            if (resultSet.wasNull()) {
+                                ps.setNull(i, Types.INTEGER);
+                            } else {
+                                ps.setInt(i, intVal);
+                            }
                             break;
                         case Types.BIGINT:
                         case Types.NUMERIC:
                         case Types.DECIMAL:
-                            ps.setBigDecimal(i, resultSet.getBigDecimal(i));
+                            java.math.BigDecimal bdVal = resultSet.getBigDecimal(i);
+                            if (resultSet.wasNull() || bdVal == null) {
+                                ps.setNull(i, Types.NUMERIC);
+                            } else {
+                                ps.setBigDecimal(i, bdVal);
+                            }
                             break;
                         case Types.DOUBLE:
-                            ps.setDouble(i, resultSet.getDouble(i));
+                            double doubleVal = resultSet.getDouble(i);
+                            if (resultSet.wasNull()) {
+                                ps.setNull(i, Types.DOUBLE);
+                            } else {
+                                ps.setDouble(i, doubleVal);
+                            }
                             break;
                         case Types.FLOAT:
-                            ps.setFloat(i, resultSet.getFloat(i));
+                        case Types.REAL:
+                            float floatVal = resultSet.getFloat(i);
+                            if (resultSet.wasNull()) {
+                                ps.setNull(i, Types.FLOAT);
+                            } else {
+                                ps.setFloat(i, floatVal);
+                            }
                             break;
                         case Types.DATE:
-                            ps.setDate(i, resultSet.getDate(i));
+                            java.sql.Date dateVal = resultSet.getDate(i);
+                            if (resultSet.wasNull() || dateVal == null) {
+                                ps.setNull(i, Types.DATE);
+                            } else {
+                                // Use UTC calendar for consistent date handling across databases
+                                java.util.Calendar cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+                                ps.setDate(i, dateVal, cal);
+                            }
                             break;
                         case Types.TIMESTAMP:
                         case Types.TIMESTAMP_WITH_TIMEZONE:
                         case -101:
                         case -102:
-                            ps.setTimestamp(i, resultSet.getTimestamp(i));
-                            break;
-                        case Types.BINARY:
-                            ps.setBytes(i,resultSet.getBytes(i));
-                            break;
-                        case Types.BLOB:
-                            Blob blobData = getBlob(resultSet,i);
-                            ps.setBlob(i, blobData);
-                            if (blobData != null) blobData.free();
-                            break;
-                        case Types.CLOB:
-                            Clob clobData = resultSet.getClob(i);
-                            //ps.setClob(i, clobData);
-                            if (clobData != null) 
-                            {                            	
-                            	//Se establece los datos del campo CLOB como un objeto java.io.Reader
-                            	ps.setClob(i, clobData.getCharacterStream());
-                            	clobData.free();
+                            java.sql.Timestamp tsVal = resultSet.getTimestamp(i);
+                            if (resultSet.wasNull() || tsVal == null) {
+                                ps.setNull(i, Types.TIMESTAMP);
+                            } else {
+                                // Use UTC calendar for consistent timestamp handling across databases
+                                java.util.Calendar cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+                                ps.setTimestamp(i, tsVal, cal);
                             }
                             break;
+                        case Types.BINARY:
+                        case Types.VARBINARY:
+                        case Types.LONGVARBINARY:
+                            byte[] bytesVal = resultSet.getBytes(i);
+                            if (resultSet.wasNull() || bytesVal == null) {
+                                ps.setNull(i, Types.BINARY);
+                            } else {
+                                ps.setBytes(i, bytesVal);
+                            }
+                            break;
+                        case Types.BLOB:
+                            // Stream BLOB without loading into memory
+                            // Keep stream open until after executeBatch()
+                            Blob blobData = getBlob(resultSet, i);
+                            streamBlobToSink(blobData, ps, i, openStreams);
+                            break;
+                        case Types.CLOB:
+                            // Stream CLOB without loading into memory
+                            // Keep stream open until after executeBatch()
+                            Clob clobData = resultSet.getClob(i);
+                            streamClobToSink(clobData, ps, i, openStreams);
+                            break;
                         case Types.BOOLEAN:
-                            ps.setBoolean(i, resultSet.getBoolean(i));
+                        case Types.BIT:
+                            // Oracle doesn't have native BOOLEAN, use NUMBER(1) with 0/1 values
+                            Boolean boolValue = resultSet.getBoolean(i);
+                            if (resultSet.wasNull()) {
+                                ps.setNull(i, Types.NUMERIC);
+                            } else {
+                                ps.setInt(i, boolValue ? 1 : 0);
+                            }
                             break;
                         case Types.NVARCHAR:
+                        case Types.NCHAR:
+                        case Types.LONGNVARCHAR:
                             ps.setNString(i, resultSet.getNString(i));
                             break;
                         case Types.SQLXML:
@@ -206,12 +348,71 @@ public class OracleManager extends SqlManager {
                         case Types.ROWID:
                             ps.setRowId(i, resultSet.getRowId(i));
                             break;
-                        //case Types.ARRAY: // Not supported by Oracle
+                        case Types.ARRAY:
+                            // Convert array to string representation for Oracle
+                            java.sql.Array arrayData = resultSet.getArray(i);
+                            if (arrayData != null) {
+                                ps.setString(i, arrayData.toString());
+                            } else {
+                                ps.setNull(i, Types.VARCHAR);
+                            }
+                            break;
                         case Types.STRUCT:
-                            ps.setObject(i, resultSet.getObject(i),Types.STRUCT);
+                            ps.setObject(i, resultSet.getObject(i), Types.STRUCT);
+                            break;
+                        case Types.OTHER:
+                            // PostgreSQL specific types (bytea, json, xml, etc.) - convert to string
+                            Object otherData = resultSet.getObject(i);
+                            if (otherData != null) {
+                                if (otherData instanceof byte[]) {
+                                    ps.setBytes(i, (byte[]) otherData);
+                                } else {
+                                    ps.setString(i, otherData.toString());
+                                }
+                            } else {
+                                ps.setNull(i, Types.VARCHAR);
+                            }
+                            break;
+                        case Types.TIME:
+                        case Types.TIME_WITH_TIMEZONE:
+                            // Oracle doesn't have a TIME-only type
+                            // When auto-create maps TIME to TIMESTAMP, convert Time to Timestamp
+                            // When explicit column type is VARCHAR, store as string
+                            java.sql.Time timeData = resultSet.getTime(i);
+                            if (timeData == null || resultSet.wasNull()) {
+                                ps.setNull(i, Types.TIMESTAMP);
+                            } else {
+                                // Convert TIME to TIMESTAMP by setting date portion to epoch (1970-01-01)
+                                java.sql.Timestamp tsFromTime = new java.sql.Timestamp(timeData.getTime());
+                                java.util.Calendar cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+                                ps.setTimestamp(i, tsFromTime, cal);
+                            }
+                            break;
+                        // Oracle INTERVAL types (not in standard java.sql.Types)
+                        case -104: // INTERVALDS (INTERVAL DAY TO SECOND)
+                        case -103: // INTERVALYM (INTERVAL YEAR TO MONTH)
+                            Object intervalData = resultSet.getObject(i);
+                            if (intervalData != null) {
+                                ps.setObject(i, intervalData);
+                            } else {
+                                ps.setNull(i, Types.VARCHAR);
+                            }
                             break;
                         default:
-                            ps.setString(i, resultSet.getString(i));
+                            // Fallback: convert to string to avoid ORA-17004
+                            Object defaultData = resultSet.getObject(i);
+                            if (defaultData != null) {
+                                if (defaultData instanceof byte[]) {
+                                    ps.setBytes(i, (byte[]) defaultData);
+                                } else if (defaultData instanceof Number) {
+                                    ps.setBigDecimal(i, new java.math.BigDecimal(defaultData.toString()));
+                                } else {
+                                    ps.setString(i, defaultData.toString());
+                                }
+                            } else {
+                                ps.setNull(i, Types.VARCHAR);
+                            }
+                            LOG.debug("Column {} has unhandled JDBC type {}, converted to string", i, rsmd.getColumnType(i));
                             break;
                     }
                 }
@@ -221,6 +422,8 @@ public class OracleManager extends SqlManager {
                 if (++count % batchSize == 0) {
                     ps.executeBatch();
                     this.getConnection().commit();
+                    // Close all streams after successful batch execution
+                    closeStreams(openStreams);
                 }
 
                 totalRows++;
@@ -228,10 +431,16 @@ public class OracleManager extends SqlManager {
         }
 
         ps.executeBatch(); // insert remaining records
-        ps.close();
-
+        this.getConnection().commit();
+        // Close all remaining streams after final batch
+        closeStreams(openStreams);
         this.getConnection().commit();
         return totalRows;
+        } finally {
+            closeStreams(openStreams);
+            unregisterActiveStatement(ps);
+            ps.close();
+        }
     }
 
     private String getInsertSQLCommand(String tableName, String allColumns, int columnsNumber) {
@@ -285,10 +494,13 @@ public class OracleManager extends SqlManager {
 
     @Override
     protected void mergeStagingTable() throws SQLException {
+        checkCancellation();
         this.getConnection().commit();
 
         Statement statement = this.getConnection().createStatement();
+        registerActiveStatement(statement);
 
+        try {
         String[] pks = this.getSinkPrimaryKeys(this.getSinkTableName());
         // Primary key is required
         if (pks == null || pks.length == 0) {
@@ -344,20 +556,244 @@ public class OracleManager extends SqlManager {
 
         LOG.info("Merging staging table and sink table with this command: {}", sql);
         statement.executeUpdate(sql.toString());
-        statement.close();
         this.getConnection().commit();
+        } finally {
+            unregisterActiveStatement(statement);
+            statement.close();
+        }
     }
 
     @Override
-    public void preSourceTasks() {}
+    public void preSourceTasks() throws Exception {
+        // Call parent to probe source metadata if auto-create is enabled
+        super.preSourceTasks();
+        
+        // Capture SCN for flashback query to prevent ORA-01555 on large tables
+        try {
+            Statement stmt = getConnection().createStatement();
+            ResultSet rs = stmt.executeQuery("SELECT CURRENT_SCN FROM V$DATABASE");
+            if (rs.next()) {
+                this.oracleSourceScn = rs.getLong(1);
+                LOG.info("Captured Oracle SCN for consistent read: {}", oracleSourceScn);
+            }
+            rs.close();
+            stmt.close();
+        } catch (SQLException e) {
+            // Graceful fallback if V$DATABASE is inaccessible (insufficient privileges)
+            LOG.warn("Could not capture Oracle SCN (V$DATABASE not accessible). " +
+                     "Flashback query disabled. Error: {}", e.getMessage());
+            this.oracleSourceScn = null;
+        }
+    }
 
     @Override
     public void postSourceTasks() {}
 
     @Override
     public void dropStagingTable() throws SQLException {
-        // Disable Oracle RECYCLEBIN
-        oracleAlterSession(false);
+        Statement stmt = null;
+        try {
+            // Commit any pending transaction before ALTER SESSION
+            if (!this.getConnection().getAutoCommit()) {
+                this.getConnection().commit();
+            }
+            // Disable Oracle RECYCLEBIN for DROP operation
+            stmt = this.getConnection().createStatement();
+            DatabaseMetaData meta = this.getConnection().getMetaData();
+            if (meta.getDatabaseMajorVersion() >= 10) {
+                stmt.executeUpdate("ALTER SESSION SET recyclebin = OFF");
+            }
+        } catch (SQLException e) {
+            LOG.warn("Could not disable recyclebin: {}", e.getMessage());
+        } finally {
+            if (stmt != null) {
+                try { stmt.close(); } catch (SQLException ignored) {}
+            }
+        }
         super.dropStagingTable();
+    }
+
+    /**
+     * Streams BLOB content from source to sink PreparedStatement using chunked transfer.
+     * This avoids LOB locator transfer issues (ORA-64219) between different Oracle versions.
+     * The BLOB content is read as a binary stream and written directly to the PreparedStatement,
+     * never materializing the entire LOB in memory.
+     *
+     * @param sourceBlob Source BLOB from ResultSet (may be null)
+    /**
+     * Streams BLOB content from source to sink PreparedStatement.
+     * The stream is kept open and tracked for later cleanup after batch execution.
+     * This avoids both ORA-64219 (LOB locators) and OutOfMemoryError (full LOB in memory).
+     *
+     * @param sourceBlob Source BLOB from ResultSet (may be null)
+     * @param ps Target PreparedStatement
+     * @param columnIndex 1-based column index
+     * @param openStreams List to track open streams for cleanup
+     * @throws SQLException if database access error occurs
+     * @throws IOException if stream read error occurs
+     */
+    private void streamBlobToSink(Blob sourceBlob, PreparedStatement ps, int columnIndex, List<AutoCloseable> openStreams) 
+            throws SQLException, IOException {
+        if (sourceBlob == null) {
+            ps.setNull(columnIndex, Types.BLOB);
+            return;
+        }
+        
+        long blobLength = sourceBlob.length();
+        if (blobLength == 0) {
+            ps.setNull(columnIndex, Types.BLOB);
+            sourceBlob.free();
+            return;
+        }
+        
+        // Stream BLOB without loading into memory
+        // Stream is kept open and will be closed after executeBatch()
+        InputStream blobStream = sourceBlob.getBinaryStream();
+        ps.setBinaryStream(columnIndex, blobStream, blobLength);
+        
+        // Track stream and blob for cleanup after batch execution
+        openStreams.add(blobStream);
+        openStreams.add(() -> sourceBlob.free());
+    }
+
+    /**
+     * Streams CLOB content from source to sink PreparedStatement.
+     * The stream is kept open and tracked for later cleanup after batch execution.
+     * This avoids both ORA-64219 (LOB locators) and OutOfMemoryError (full LOB in memory).
+     *
+     * @param sourceClob Source CLOB from ResultSet (may be null)
+     * @param ps Target PreparedStatement
+     * @param columnIndex 1-based column index
+     * @param openStreams List to track open streams for cleanup
+     * @throws SQLException if database access error occurs
+     * @throws IOException if stream read error occurs
+     */
+    private void streamClobToSink(Clob sourceClob, PreparedStatement ps, int columnIndex, List<AutoCloseable> openStreams) 
+            throws SQLException, IOException {
+        if (sourceClob == null) {
+            ps.setNull(columnIndex, Types.CLOB);
+            return;
+        }
+        
+        long clobLength = sourceClob.length();
+        if (clobLength == 0) {
+            ps.setNull(columnIndex, Types.CLOB);
+            sourceClob.free();
+            return;
+        }
+        
+        // Stream CLOB without loading into memory
+        // Stream is kept open and will be closed after executeBatch()
+        Reader clobReader = sourceClob.getCharacterStream();
+        ps.setCharacterStream(columnIndex, clobReader, clobLength);
+        
+        // Track stream and clob for cleanup after batch execution
+        openStreams.add(clobReader);
+        openStreams.add(() -> sourceClob.free());
+    }
+
+    /**
+     * Closes all tracked streams and frees LOB resources after batch execution.
+     * This is called after executeBatch() to properly cleanup resources.
+     *
+     * @param openStreams List of streams and LOBs to close/free
+     */
+    private void closeStreams(List<AutoCloseable> openStreams) {
+        for (AutoCloseable resource : openStreams) {
+            try {
+                if (resource != null) {
+                    resource.close();
+                }
+            } catch (Exception e) {
+                LOG.warn("Error closing LOB stream/resource: {}", e.getMessage());
+            }
+        }
+        openStreams.clear();
+    }
+
+    @Override
+    protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+        switch (jdbcType) {
+            case Types.INTEGER:
+            case Types.TINYINT:
+            case Types.SMALLINT:
+                return "NUMBER(10)";
+            case Types.BIGINT:
+                return "NUMBER(19)";
+            case Types.FLOAT:
+            case Types.DOUBLE:
+                return "BINARY_DOUBLE";
+            case Types.REAL:
+                return "BINARY_FLOAT";
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                // Oracle NUMBER without precision means generic number
+                if (precision == 0 && scale == -127) {
+                    return "NUMBER";
+                } 
+                // Oracle uses negative scale (-127) to indicate floating-point approximation
+                // REAL/DOUBLE PRECISION/FLOAT are reported as NUMBER with precision 63/126 and scale -127
+                // Map these to native binary float types instead of invalid NUMBER syntax
+                else if (scale == -127) {
+                    if (precision <= 63) {
+                        return "BINARY_FLOAT";
+                    } else {
+                        return "BINARY_DOUBLE";
+                    }
+                } 
+                else if (precision > 0) {
+                    return "NUMBER(" + precision + ", " + scale + ")";
+                } else {
+                    return "NUMBER";
+                }
+            case Types.VARCHAR:
+            case Types.NVARCHAR:
+            case Types.LONGVARCHAR:
+                if (precision > 4000) {
+                    return "CLOB";
+                } else if (precision > 0) {
+                    return "VARCHAR2(" + precision + ")";
+                } else {
+                    return "CLOB";
+                }
+            case Types.CHAR:
+            case Types.NCHAR:
+                return "CHAR(" + precision + ")";
+            case Types.BOOLEAN:
+            case Types.BIT:
+                return "NUMBER(1)";
+            case Types.DATE:
+                return "DATE";
+            case Types.TIME:
+            case Types.TIME_WITH_TIMEZONE:
+            case Types.TIMESTAMP:
+            case Types.TIMESTAMP_WITH_TIMEZONE:
+                return "TIMESTAMP";
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+                if (precision > 2000) {
+                    return "BLOB";
+                } else if (precision > 0) {
+                    return "RAW(" + precision + ")";
+                } else {
+                    return "BLOB";
+                }
+            case Types.BLOB:
+                return "BLOB";
+            case Types.CLOB:
+                return "CLOB";
+            // Oracle-specific INTERVAL types
+            case -104:  // INTERVAL DAY TO SECOND
+                return "INTERVAL DAY TO SECOND";
+            case -103:  // INTERVAL YEAR TO MONTH
+                return "INTERVAL YEAR TO MONTH";
+            // Oracle XMLType
+            case 2009:  // SQLXML / XMLType
+                return "XMLTYPE";
+            default:
+                LOG.warn("Unmapped JDBC type {} for column {}, using CLOB as fallback", jdbcType, columnName);
+                return "CLOB";
+        }
     }
 }

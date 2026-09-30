@@ -60,6 +60,15 @@ REPLICADB_CLASSPATH=${REPLICADB_CONF_DIR}:${REPLICADB_CLASSPATH}
 add_to_classpath ${REPLICADB_JAR_DIR}
 
 # -----------------------------------------------------------------------------
+#  Detect OS platform
+# -----------------------------------------------------------------------------
+
+darwin=false
+case "$(uname)" in
+  Darwin*) darwin=true ;;
+esac
+
+# -----------------------------------------------------------------------------
 #  Set JAVA_HOME or JRE_HOME if not already set
 # -----------------------------------------------------------------------------
 
@@ -105,11 +114,14 @@ fi
 
 # Set default initial memory allocation and maximum memory allocation
 if [[ -z "$JAVA_OPTS" ]]; then
-  JAVA_OPTS="-Xmx256M -Xms256M"
+  JAVA_OPTS="-Xmx256M -Xms256M --add-opens=java.base/java.nio=ALL-UNNAMED"
 fi
 
 if [[ -z "$JVM_PERFORMANCE_OPTS" ]]; then
-  JVM_PERFORMANCE_OPTS="-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true -Djavax.xml.parsers.DocumentBuilderFactory=org.apache.xerces.jaxp.DocumentBuilderFactoryImpl"
+  JVM_PERFORMANCE_OPTS="-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35 -XX:+ExplicitGCInvokesConcurrent -Djavax.xml.parsers.DocumentBuilderFactory=org.apache.xerces.jaxp.DocumentBuilderFactoryImpl"
+  if [[ "${REPLICADB_HEADLESS:-false}" == "true" ]]; then
+    JVM_PERFORMANCE_OPTS="${JVM_PERFORMANCE_OPTS} -Djava.awt.headless=true"
+  fi
 fi
 
 # Uncomment this if you want to activate the monitoring via JMX
@@ -128,4 +140,3 @@ export JMX_OPTS
 export REPLICADB_CLASSPATH
 export REPLICADB_CONF_DIR
 export REPLICADB_JAR_DIR
-

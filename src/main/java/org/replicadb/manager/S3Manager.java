@@ -19,7 +19,6 @@ import org.replicadb.manager.file.FileManagerFactory;
 
 import java.net.URI;
 import java.sql.*;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 
@@ -189,7 +188,7 @@ public class S3Manager extends SqlManager {
         LOG.debug("Using serviceEndpoint: " + serviceEndpoint);
 
         // Get Bucket name
-        String bucketName = s3Uri.getPath().replaceAll("/$", "");
+        String bucketName = s3Uri.getPath().replaceFirst("^/", "").replaceAll("/$", "");
         if (keyFileName == null) {
             this.keyFileName = bucketName.substring(bucketName.lastIndexOf("/") + 1);
             bucketName = bucketName.replace(keyFileName,"").replaceAll("/$", "");
@@ -201,7 +200,6 @@ public class S3Manager extends SqlManager {
         AWSCredentials credentials = new BasicAWSCredentials(accessKey, secretKey);
         AmazonS3 s3Client = AmazonS3ClientBuilder
                 .standard()
-                .withRegion("")
                 .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(serviceEndpoint, null))
                 .withPathStyleAccessEnabled(true)
                 .withCredentials(new AWSStaticCredentialsProvider(credentials))
@@ -297,6 +295,11 @@ public class S3Manager extends SqlManager {
     protected void mergeStagingTable() {/*Not implemented*/}
 
     @Override
+    protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+        throw new UnsupportedOperationException("S3 does not support SQL DDL. Use --sink-auto-create only with SQL databases.");
+    }
+
+    @Override
     public void preSourceTasks() {/*Not implemented*/}
 
     @Override
@@ -313,4 +316,3 @@ public class S3Manager extends SqlManager {
     }
 
 }
-

@@ -1,0 +1,38 @@
+server:
+  port: ${PORT:8080}
+spring:
+  application:
+    name: replicadb-server
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration
+management:
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+replicadb:
+  security:
+    keyring:
+      file: ${REPLICADB_SECURITY_KEYRING_FILE:${REPLICADB_SECURITY_MASTER_KEY_FILE:/run/secrets/replicadb-master-key}}
+      current:
+        version: ${REPLICADB_SECURITY_KEYRING_CURRENT_VERSION:}
+        key: ${REPLICADB_SECURITY_KEYRING_CURRENT_KEY:}
+      secondary:
+        version: ${REPLICADB_SECURITY_KEYRING_SECONDARY_VERSION:}
+        key: ${REPLICADB_SECURITY_KEYRING_SECONDARY_KEY:}
+  server:
+    execution:
+      pool-size: 4
+    audit:
+      retention-days: 365
+    run-log:
+      retention-days: ${REPLICADB_RUN_LOG_RETENTION_DAYS:${replicadb.server.audit.retention-days:365}}
+      batch-size: ${REPLICADB_RUN_LOG_RETENTION_BATCH_SIZE:1000}

@@ -3,9 +3,10 @@ package org.replicadb.manager;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ToolOptions;
+import org.replicadb.execution.ReplicationCancelledException;
+import org.replicadb.execution.ReplicationDiagnosticEvent;
 
 import java.sql.*;
-import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -27,8 +28,6 @@ public abstract class ConnManager {
     public static final String SUBSTITUTE_TOKEN = "$CONDITIONS";
 
     protected ToolOptions options;
-
-    private static String randomSinkStagingTableName;
 
     /**
      * Execute a SQL statement to read the named set of columns from a table.
@@ -141,28 +140,65 @@ public abstract class ConnManager {
 
     }
 
+    /**
+     * Returns a schema-qualified sink table name for CREATE TABLE statements.
+     * If the sink table name already contains a schema (schema.table), returns it as-is.
+     * Otherwise, attempts to qualify it with the connection's current schema.
+     * 
+     * @return schema-qualified table name, or unqualified name if no schema can be determined
+     */
+    public String getQualifiedSinkTableName() {
+        String tableName = getSinkTableName();
+        
+        // If already qualified (contains a dot), return as-is
+        if (tableName.contains(".")) {
+            return tableName;
+        }
+        
+        // Try to get schema from connection metadata
+        try {
+            String schema = this.getConnection().getSchema();
+            if (schema != null && !schema.isEmpty()) {
+                LOG.debug("Qualifying sink table name with connection schema: {}.{}", schema, tableName);
+                return schema + "." + tableName;
+            }
+        } catch (Exception e) {
+            LOG.debug("Could not retrieve schema from connection: {}", e.getMessage());
+        }
+        
+        // Fallback: return unqualified name
+        return tableName;
+    }
+
     public String getSinkStagingTableName() {
 
         if (options.getSinkStagingTable() != null && !options.getSinkStagingTable().isEmpty()) {
             return this.options.getSinkStagingTable();
-        } else if (randomSinkStagingTableName != null && !randomSinkStagingTableName.isEmpty()) {
-            return randomSinkStagingTableName;
-        } else {
-            // Create new randomSinkStagingTableName
+        }
+
+        String generatedName = options.getExecutionContext().getSinkStagingTableName();
+        if (generatedName != null && !generatedName.isEmpty()) {
+            return generatedName;
+        }
+
+        synchronized (options.getExecutionContext()) {
+            generatedName = options.getExecutionContext().getSinkStagingTableName();
+            if (generatedName != null && !generatedName.isEmpty()) {
+                return generatedName;
+            }
+
             Random random = new Random();
             String randomName = "repdb" + random.nextInt(90) + 10;
 
             String tableName = getSinkTableName();
 
-            // Staging table Alias name.
-            // Sometimes the size of the table along with the random name exceeds the maximum size of an object name in some databases
             if (options.getSinkStagingTableAlias() != null && !options.getSinkStagingTableAlias().isEmpty()) {
                 tableName = options.getSinkStagingTableAlias();
             }
 
-            randomSinkStagingTableName = getTableNameFromQualifiedTableName(tableName) + randomName;
-
-            return randomSinkStagingTableName;
+            generatedName = getTableNameFromQualifiedTableName(tableName) + randomName;
+            options.getExecutionContext().setSinkStagingTableName(generatedName);
+            return generatedName;
         }
     }
 
@@ -199,10 +235,14 @@ public abstract class ConnManager {
 
         for (int i = 1; i <= columnsNumber; i++) {
             if (i > 1) columnNames.append(",");
+            String columnName = rsmd.getColumnLabel(i);
+            if (columnName == null || columnName.isEmpty()) {
+                columnName = rsmd.getColumnName(i);
+            }
             if (this.options.getQuotedIdentifiers())
-                columnNames.append("\"").append(rsmd.getColumnName(i)).append("\"");
+                columnNames.append("\"").append(columnName).append("\"");
             else
-                columnNames.append(rsmd.getColumnName(i));
+                columnNames.append(columnName);
         }
         return columnNames.toString();
     }
@@ -266,5 +306,37 @@ public abstract class ConnManager {
      * @return
      */
     public abstract String[] getSinkPrimaryKeys(String tableName);
+
+    protected void checkCancellation() throws ReplicationCancelledException {
+        if (options.getExecutionContext().isCancellationRequested()) {
+            options.getExecutionContext().getDiagnosticCollector().record(
+                    ReplicationDiagnosticEvent.Stage.CANCELLATION,
+                    ReplicationDiagnosticEvent.Category.CANCELLATION,
+                    ReplicationDiagnosticEvent.Severity.INFO, null, getClass().getSimpleName(),
+                    "Cancellation observed", null);
+            throw new ReplicationCancelledException(
+                    "Replication run " + options.getExecutionContext().getRunId() + " was cancelled");
+        }
+    }
+
+    protected void registerActiveStatement(Statement statement) {
+        options.getExecutionContext().registerActiveStatement(statement);
+    }
+
+    protected void unregisterActiveStatement(Statement statement) {
+        options.getExecutionContext().unregisterActiveStatement(statement);
+    }
+
+    /**
+     * Resolves this task's highest observed watermark column value after a successful read.
+     * Default no-op for non-SQL managers that cannot build a bindable SQL watermark probe.
+     *
+     * @param taskId the task identifier
+     * @return the highest-precision textual representation of the observed value, or null when
+     *         no watermark column is configured or the manager does not support one.
+     */
+    public String resolveWatermarkCandidate(int taskId) throws SQLException {
+        return null;
+    }
 
 }

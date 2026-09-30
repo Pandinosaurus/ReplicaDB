@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Maven dependencies (Java project)
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "org.apache.hive:hive-storage-api"
+        update-types: ["version-update:semver-major"]
+
+  # Bundler dependencies (Jekyll docs)
+  - package-ecosystem: "bundler"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

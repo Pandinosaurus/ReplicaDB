@@ -4,15 +4,16 @@ import com.google.common.io.CharSource;
 import com.mysql.cj.jdbc.JdbcPreparedStatement;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.io.input.ReaderInputStream;
-import org.mariadb.jdbc.MariaDbStatement;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.manager.util.BandwidthThrottling;
+import org.replicadb.manager.util.WatermarkBinder;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.util.Properties;
@@ -67,11 +68,13 @@ public class MySQLManager extends SqlManager {
          // Get MySQL LOAD DATA manager
          String loadDataSql = getLoadDataSql(tableName, allColumns, rsmd);
          PreparedStatement statement = this.connection.prepareStatement(loadDataSql);
+         registerActiveStatement(statement);
 
+         try {
          JdbcPreparedStatement mysqlStatement = null;
-         MariaDbStatement mariadbStatement = null;
-         if (statement.isWrapperFor(MariaDbStatement.class)) {
-            mariadbStatement = statement.unwrap(MariaDbStatement.class);
+         org.mariadb.jdbc.Statement mariadbStatement = null;
+         if (statement.isWrapperFor(org.mariadb.jdbc.Statement.class)) {
+            mariadbStatement = statement.unwrap(org.mariadb.jdbc.Statement.class);
          } else {
             mysqlStatement = statement.unwrap(JdbcPreparedStatement.class);
          }
@@ -92,6 +95,7 @@ public class MySQLManager extends SqlManager {
             BandwidthThrottling bt = new BandwidthThrottling(options.getBandwidthThrottling(), options.getFetchSize(), resultSet);
 
             do {
+               checkCancellation();
                bt.acquiere();
 
                // Get Columns values
@@ -133,7 +137,7 @@ public class MySQLManager extends SqlManager {
 
                // Copy data to mysql
                if (++rowCounts % batchSize == 0) {
-                  copyData(loadDataSql, row, mariadbStatement, mysqlStatement);
+                  copyData(loadDataSql, row, mariadbStatement, mysqlStatement, statement);
 
                   // Clear StringBuilders
                   row.setLength(0); // set length of buffer to 0
@@ -150,7 +154,11 @@ public class MySQLManager extends SqlManager {
 
          // insert remaining records
          if (rowCounts != 0) {
-            copyData(loadDataSql, row, mariadbStatement, mysqlStatement);
+            copyData(loadDataSql, row, mariadbStatement, mysqlStatement, statement);
+         }
+         } finally {
+            unregisterActiveStatement(statement);
+            statement.close();
          }
 
       } catch (Exception e) {
@@ -162,14 +170,27 @@ public class MySQLManager extends SqlManager {
       return totalRows;
    }
 
-   private void copyData (String loadDataSql, StringBuilder row, MariaDbStatement mariadbStatement, JdbcPreparedStatement mysqlStatement) throws IOException, SQLException {
+   /**
+    * Copy data to MySQL/MariaDB using LOAD DATA LOCAL INFILE
+    * @param row StringBuilder guaranteed non-null by insertDataToTable contract
+    */
+   @SuppressWarnings("null") // row parameter is guaranteed non-null by calling contract in insertDataToTable
+   private void copyData (String loadDataSql, StringBuilder row, org.mariadb.jdbc.Statement mariadbStatement, JdbcPreparedStatement mysqlStatement, PreparedStatement preparedStatement) throws IOException, SQLException {
       if (mysqlStatement != null) {
-         mysqlStatement.setLocalInfileInputStream(new ReaderInputStream(CharSource.wrap(row).openStream(), StandardCharsets.UTF_8));
+         InputStream inputStream = ReaderInputStream.builder()
+            .setReader(CharSource.wrap(row).openStream())
+            .setCharset(StandardCharsets.UTF_8)
+            .get();
+         mysqlStatement.setLocalInfileInputStream(inputStream);
          mysqlStatement.executeUpdate(loadDataSql);
       } else {
          assert mariadbStatement != null;
-         mariadbStatement.setLocalInfileInputStream(new ReaderInputStream(CharSource.wrap(row).openStream(), StandardCharsets.UTF_8));
-         mariadbStatement.executeUpdate(loadDataSql);
+         InputStream inputStream = ReaderInputStream.builder()
+            .setReader(CharSource.wrap(row).openStream())
+            .setCharset(StandardCharsets.UTF_8)
+            .get();
+         mariadbStatement.setLocalInfileInputStream(inputStream);
+         preparedStatement.executeUpdate();
       }
    }
 
@@ -184,16 +205,17 @@ public class MySQLManager extends SqlManager {
          loadDataSql.append(" (");
          String[] columns = allColumns.split(",");
          for (int i = 0; i < columns.length; i++) {
+            String col = columns[i].trim(); // Trim whitespace from column names
             switch (rsmd.getColumnType(i + 1)) {
                case Types.BIT:
                case Types.BINARY:
                case Types.BLOB:
                case Types.VARBINARY:
                case Types.LONGVARBINARY:
-                  loadDataSql.append("@").append(columns[i]).append(", ");
+                  loadDataSql.append("@").append(col).append(", ");
                   break;
                default:
-                  loadDataSql.append(columns[i]).append(", ");
+                  loadDataSql.append(col).append(", ");
                   break;
             }
          }
@@ -204,13 +226,14 @@ public class MySQLManager extends SqlManager {
          // SET variables with UNHEX
          String setPrefix = " SET ";
          for (int i = 0; i < columns.length; i++) {
+            String col = columns[i].trim(); // Trim whitespace from column names
             switch (rsmd.getColumnType(i + 1)) {
                case Types.BIT:
                case Types.BINARY:
                case Types.BLOB:
                case Types.VARBINARY:
                case Types.LONGVARBINARY:
-                  loadDataSql.append(setPrefix).append(columns[i]).append("=UNHEX(@").append(columns[i]).append(") ");
+                  loadDataSql.append(setPrefix).append(col).append("=UNHEX(@").append(col).append(") ");
                   loadDataSql.append(", ");
                   setPrefix = "";
                   break;
@@ -251,7 +274,9 @@ public class MySQLManager extends SqlManager {
 
    @Override
    protected void mergeStagingTable () throws SQLException {
+      checkCancellation();
       Statement statement = this.getConnection().createStatement();
+      registerActiveStatement(statement);
 
       try {
          String[] pks = this.getSinkPrimaryKeys(this.getSinkTableName());
@@ -275,13 +300,14 @@ public class MySQLManager extends SqlManager {
 
          LOG.info("Merging staging table and sink table with this command: {}", sql);
          statement.executeUpdate(sql.toString());
-         statement.close();
          this.getConnection().commit();
 
       } catch (Exception e) {
-         statement.close();
          this.connection.rollback();
          throw e;
+      } finally {
+         unregisterActiveStatement(statement);
+         statement.close();
       }
    }
 
@@ -310,16 +336,36 @@ public class MySQLManager extends SqlManager {
          }
       }
 
+      Object watermarkBindValue = null;
+      if (options.getSourceQuery() == null && options.getIncrementalWatermarkColumn() != null
+          && options.getIncrementalWatermarkValue() != null) {
+         watermarkBindValue = WatermarkBinder.convertToBoundValue(options.getIncrementalWatermarkValue(),
+             WatermarkBinder.resolveColumnType(options.getSourceColumnDescriptors(), options.getIncrementalWatermarkColumn()));
+         sqlCmd = sqlCmd + (sqlCmd.contains(" WHERE ") ? " AND " : " WHERE ")
+             + escapeColName(options.getIncrementalWatermarkColumn()) + " > ?";
+      }
+
       if (chunkSize != 0L) {
          sqlCmd = sqlCmd + " LIMIT ? OFFSET ?";
-         return super.execute(sqlCmd, chunkSize, offset);
+         return watermarkBindValue != null
+             ? super.execute(sqlCmd, watermarkBindValue, chunkSize, offset)
+             : super.execute(sqlCmd, chunkSize, offset);
       } else {
-         return super.execute(sqlCmd);
+         return watermarkBindValue != null
+             ? super.execute(sqlCmd, watermarkBindValue)
+             : super.execute(sqlCmd);
       }
    }
 
    @Override
    public void preSourceTasks () throws SQLException {
+      // Call parent to probe source metadata if auto-create is enabled
+      try {
+          super.preSourceTasks();
+      } catch (Exception e) {
+          throw new SQLException("Failed to probe source metadata", e);
+      }
+      
       // Because chunkSize is static it's required to initialize it
       // when the unit tests are running
       chunkSize = 0L;
@@ -337,11 +383,16 @@ public class MySQLManager extends SqlManager {
             sql = sql + "( " + this.options.getSourceQuery() + " ) as REPLICADB_TABLE";
 
          } else {
-
+            // Source table
             sql = sql + this.options.getSourceTable();
-            // Source Where
-            if (options.getSourceWhere() != null && !options.getSourceWhere().isEmpty()) {
-               sql = sql + " WHERE " + options.getSourceWhere();
+         }
+         // Source Where
+         if (options.getSourceWhere() != null && !options.getSourceWhere().isEmpty()) {
+            if (options.getSourceQuery() != null && !options.getSourceQuery().isEmpty()) {
+               // SourceWhere should not be used when query is set
+               LOG.warn("source-where is ignored when source-query is specified.");
+            } else {
+               sql = sql + " WHERE " + this.options.getSourceWhere();
             }
          }
 
@@ -390,5 +441,83 @@ public class MySQLManager extends SqlManager {
       return returnData;
    }
 
+   @Override
+   protected String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale) {
+       switch (jdbcType) {
+           case Types.INTEGER:
+               return "INT";
+           case Types.TINYINT:
+               return "TINYINT";
+           case Types.SMALLINT:
+               return "SMALLINT";
+           case Types.BIGINT:
+               return "BIGINT";
+           case Types.FLOAT:
+           case Types.REAL:
+               return "FLOAT";
+           case Types.DOUBLE:
+               return "DOUBLE";
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                // Special case: Oracle REAL/DOUBLE PRECISION/FLOAT come through as NUMERIC with scale=-127
+                // Map based on precision: FLOAT (p=63), DOUBLE (p=126), or DOUBLE (other)
+                if (scale == -127) {
+                    if (precision == 63) {
+                        return "FLOAT";
+                    } else {
+                        return "DOUBLE";  // For precision=126 or other Oracle FLOATs
+                    }
+                }
+                if (precision > 0) {
+                    return "DECIMAL(" + precision + ", " + scale + ")";
+                } else {
+                    return "DECIMAL";
+                }
+           case Types.VARCHAR:
+           case Types.NVARCHAR:
+           case Types.LONGVARCHAR:
+               if (precision > 16383) {
+                   return "LONGTEXT";
+               } else if (precision > 0) {
+                   return "VARCHAR(" + precision + ")";
+               } else {
+                   return "LONGTEXT";
+               }
+           case Types.CHAR:
+           case Types.NCHAR:
+               return "CHAR(" + precision + ")";
+           case Types.BOOLEAN:
+           case Types.BIT:
+               return "BOOLEAN";
+           case Types.DATE:
+               return "DATE";
+           case Types.TIME:
+           case Types.TIME_WITH_TIMEZONE:
+               return "TIME";
+           case Types.TIMESTAMP:
+           case Types.TIMESTAMP_WITH_TIMEZONE:
+               return "DATETIME";
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+                // MariaDB/MySQL have row size limit of ~65KB for all columns combined
+                // Use BLOB types for large binary data to avoid "Column length too big" errors
+                // Conservative threshold: use BLOB for columns > 16KB to leave room for other columns
+                if (precision > 16384) {
+                    return "LONGBLOB";
+                } else if (precision > 0) {
+                    return "VARBINARY(" + precision + ")";
+                } else {
+                    return "LONGBLOB";
+                }
+           case Types.BLOB:
+               return "LONGBLOB";
+           case Types.CLOB:
+               return "LONGTEXT";
+           default:
+               LOG.warn("Unmapped JDBC type {} for column {}, using LONGTEXT as fallback", jdbcType, columnName);
+               return "LONGTEXT";
+       }
+   }
 
 }

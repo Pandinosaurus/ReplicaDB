@@ -1,8 +1,7 @@
 package org.replicadb.manager.file;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ToolOptions;
+import org.replicadb.execution.ReplicationCancelledException;
 import org.replicadb.manager.DataSourceType;
 
 import java.io.File;
@@ -10,9 +9,6 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.URISyntaxException;
 import java.sql.*;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -21,7 +17,6 @@ import java.util.Map;
  * the files about formats, compressions, etc.
  */
 public abstract class FileManager {
-    private static final Logger LOG = LogManager.getLogger(FileManager.class);
 
     /**
      * The ReplicaDB options defined by the user
@@ -35,13 +30,9 @@ public abstract class FileManager {
     /**
      * String array with the paths of the temporal files
      */
-    protected static Map<Integer, String> tempFilesPath;
-
-
     public FileManager(ToolOptions opts, DataSourceType dsType) {
         this.options = opts;
         this.dsType = dsType;
-        newTempFilesPath();
     }
 
     /**
@@ -80,27 +71,27 @@ public abstract class FileManager {
     /**
      * Getters and Setters
      */
-    public static synchronized void newTempFilesPath() {
-        if (tempFilesPath == null)
-            tempFilesPath =  new HashMap<>();
+    public Map<Integer, String> getTempFilesPath() {
+        return options.getExecutionContext().getTempFilesPath();
     }
 
-    public static synchronized Map<Integer, String> getTempFilesPath() {
-        return tempFilesPath;
+    public void setTempFilePath(int taskId, String path) {
+        options.getExecutionContext().setTempFilePath(taskId, path);
     }
 
-    public static synchronized void setTempFilesPath(Map<Integer, String> tempFilesPath) {FileManager.tempFilesPath = tempFilesPath;}
-
-    public static synchronized void setTempFilePath(int taskId, String path) {
-        tempFilesPath.put(taskId, path);
+    public String getTempFilePath(int idx) {
+        return options.getExecutionContext().getTempFilePath(idx);
     }
 
-    public static synchronized String getTempFilePath(int idx) {
-        return tempFilesPath.get(idx);
+    public int getTempFilePathSize() {
+        return options.getExecutionContext().getTempFilePathSize();
     }
 
-    public static synchronized int getTempFilePathSize() {
-        return tempFilesPath.size();
+    protected void checkCancellation() throws ReplicationCancelledException {
+        if (options.getExecutionContext().isCancellationRequested()) {
+            throw new ReplicationCancelledException(
+                    "Replication run " + options.getExecutionContext().getRunId() + " was cancelled");
+        }
     }
 
 }

@@ -255,7 +255,6 @@ public class MongoDBRowSetImpl extends StreamingRowSetImpl {
 		Document document;
 
 		// Load fetch size documents into the rowset using direct row appending
-		int loadedCount = 0;
 		for (int i = 1; i <= currentFetchSize && this.cursor.hasNext(); i++) {
 			try {
 				document = this.cursor.next();
@@ -278,7 +277,6 @@ public class MongoDBRowSetImpl extends StreamingRowSetImpl {
 					this.appendRow(rowData);
 				}
 				this.incrementRowCount();
-				loadedCount++;
 			} catch (final Exception e) {
 				LOG.error("MongoDB error processing document {}: {}", i, e.getMessage(), e);
 				throw e;
@@ -321,6 +319,12 @@ public class MongoDBRowSetImpl extends StreamingRowSetImpl {
 			case Types.DECIMAL :
 				final Long longValue = document.getLong(columnName);
 				return longValue != null ? BigDecimal.valueOf(longValue) : null;
+			case Types.FLOAT :
+			case Types.REAL :
+				// MongoDB stores all floats as doubles (64-bit), but SQL REAL/FLOAT expects 32-bit
+				// Cast to float to match SQL standard REAL precision (4 bytes)
+				final Double floatAsDouble = document.getDouble(columnName);
+				return floatAsDouble != null ? floatAsDouble.floatValue() : null;
 			case Types.DOUBLE :
 				return document.getDouble(columnName);
 			case Types.TIMESTAMP_WITH_TIMEZONE :

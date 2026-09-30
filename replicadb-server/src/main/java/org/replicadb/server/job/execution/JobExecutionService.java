@@ -1,0 +1,190 @@
+package org.replicadb.server.job.execution;
+
+import org.replicadb.ReplicaDB;
+import org.replicadb.cli.ToolOptions;
+import org.replicadb.config.CredentialRedactor;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.replicadb.server.audit.AuditActorResolver;
+import org.replicadb.server.audit.AuditService;
+import org.replicadb.server.audit.domain.AuditAction;
+import org.replicadb.server.audit.domain.AuditOutcome;
+import org.replicadb.server.audit.domain.AuditResourceType;
+import org.replicadb.server.job.domain.JobDefinition;
+import org.replicadb.server.job.domain.ClaimedRunPreparation;
+import org.replicadb.server.job.domain.JobRun;
+import org.replicadb.server.job.domain.JobRunStatus;
+import org.replicadb.server.job.domain.LeaseToken;
+import org.replicadb.server.job.application.RunFinalizationService;
+import org.replicadb.server.job.application.RunLeaseService;
+import org.replicadb.server.job.application.RunPreparationService;
+import org.replicadb.server.job.port.JobRunStore;
+import org.replicadb.server.job.port.RunLogStore;
+import org.replicadb.server.job.domain.RunLog;
+import org.replicadb.execution.ReplicationLogContext;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.Optional;
+import java.util.Map;
+import java.util.function.Consumer;
+import java.time.Instant;
+
+@Service
+public class JobExecutionService {
+
+    private static final Logger LOG = LogManager.getLogger(JobExecutionService.class);
+
+    private final JobRunStore jobRunStore;
+    private final RunPreparationService runPreparationService;
+    private final RunFinalizationService runFinalizationService;
+    private final DatasourceResolutionService datasourceResolutionService;
+    private final ManagedToolOptionsFactory managedToolOptionsFactory;
+    private final AuditService auditService;
+    private final AuditActorResolver auditActorResolver;
+    private final ActiveRunRegistry activeRunRegistry;
+    private final RunLogStore runLogStore;
+
+    @Autowired
+    public JobExecutionService(JobRunStore jobRunStore,
+                               RunPreparationService runPreparationService,
+                               RunFinalizationService runFinalizationService,
+                               DatasourceResolutionService datasourceResolutionService,
+                               ManagedToolOptionsFactory managedToolOptionsFactory,
+                               AuditService auditService,
+                               AuditActorResolver auditActorResolver,
+                               ActiveRunRegistry activeRunRegistry,
+                               RunLogStore runLogStore) {
+        this.jobRunStore = jobRunStore;
+        this.runPreparationService = runPreparationService;
+        this.runFinalizationService = runFinalizationService;
+        this.datasourceResolutionService = datasourceResolutionService;
+        this.managedToolOptionsFactory = managedToolOptionsFactory;
+        this.auditService = auditService;
+        this.auditActorResolver = auditActorResolver;
+        this.activeRunRegistry = activeRunRegistry;
+        this.runLogStore = runLogStore;
+    }
+
+    public Optional<JobRunOutcome> executeNextPending(String executorIdentity) {
+        Optional<ClaimedRunPreparation> claimed = runPreparationService.claimNextEligible(executorIdentity,
+            java.time.Duration.ofMinutes(5));
+        return claimed.map(preparation -> executeClaimedRun(preparation, handle -> { }));
+    }
+
+        public JobRunOutcome executeClaimedRun(ClaimedRunPreparation preparation,
+                           Consumer<RunExecutionHandle> onStarted) {
+        JobRun run = preparation.run();
+        ToolOptions options = null;
+        RunExecutionHandle handle = null;
+        RunLogCaptureRegistry.Capture capture = RunLogCaptureAppender.registry().register(run.id().toString());
+        Instant captureStarted = Instant.now();
+        ReplicationLogContext.Scope logContext = ReplicationLogContext.bindRunId(run.id().toString());
+        try {
+            JobDefinition definition = preparation.definition();
+                String previousWatermark = jobRunStore.findLastCommittedWatermark(definition.id())
+                    .orElse(definition.initialWatermarkValue());
+            options = managedToolOptionsFactory.build(datasourceResolutionService.resolve(preparation),
+                previousWatermark);
+                RunLogCaptureAppender.registry().alias(options.getExecutionContext().getRunId(), capture);
+                handle = new RunExecutionHandle(run, options);
+                if (!activeRunRegistry.register(handle)) {
+                    throw new IllegalStateException("JobRun is already active locally: " + run.id());
+                }
+                onStarted.accept(handle);
+
+            int exitCode = ReplicaDB.processReplica(options);
+            JobRunStatus status = JobRunStatus.fromReplicaExitCode(exitCode);
+            long rowsProcessed = options.getExecutionContext().getRowsProcessed();
+            long durationMillis = options.getExecutionContext().getDurationMillis();
+            LeaseToken leaseToken = requireLeaseToken(run);
+            if (status == JobRunStatus.SUCCEEDED) {
+                JobRunStore.FencedUpdateResult result = runFinalizationService.markSucceeded(run.id(), leaseToken,
+                        rowsProcessed, durationMillis, options.getExecutionContext().getWatermarkCandidate());
+                recordIfUpdated(result, run, status, rowsProcessed, durationMillis, null);
+            } else if (status == JobRunStatus.CANCELLED) {
+                JobRunStore.FencedUpdateResult result = runFinalizationService.markCancelled(
+                        run.id(), leaseToken, rowsProcessed, durationMillis);
+                recordIfUpdated(result, run, status, rowsProcessed, durationMillis, null);
+            } else {
+                String errorMessage = redactedFailureMessage(options.getExecutionContext().getDiagnosticCollector()
+                    .snapshot().events().stream().findFirst().map(event -> event.message()).orElse(
+                        "ReplicaDB execution failed for run " + run.id()));
+                JobRunStore.FencedUpdateResult result = runFinalizationService.markFailed(
+                        run.id(), leaseToken, rowsProcessed, durationMillis, errorMessage);
+                recordIfUpdated(result, run, JobRunStatus.FAILED, rowsProcessed, durationMillis, errorMessage);
+            }
+            persistRunLog(run.id(), capture, captureStarted);
+            return new JobRunOutcome(run.id(), status, rowsProcessed, durationMillis);
+        } catch (Exception exception) {
+            long rowsProcessed = options == null ? 0 : options.getExecutionContext().getRowsProcessed();
+            long durationMillis = options == null ? 0 : options.getExecutionContext().getDurationMillis();
+            String message = CredentialRedactor.redactMessage(exception.getMessage());
+            if (message == null || message.isBlank()) {
+                message = exception.getClass().getSimpleName();
+            }
+                JobRunStore.FencedUpdateResult result = runFinalizationService.markFailed(
+                    run.id(), requireLeaseToken(run), rowsProcessed, durationMillis, message);
+                recordIfUpdated(result, run, JobRunStatus.FAILED, rowsProcessed, durationMillis, message);
+            persistRunLog(run.id(), capture, captureStarted);
+            return new JobRunOutcome(run.id(), JobRunStatus.FAILED, rowsProcessed, durationMillis);
+        } finally {
+            logContext.close();
+            RunLogCaptureAppender.registry().unregister(capture);
+            if (handle != null) {
+                activeRunRegistry.remove(run.id(), handle);
+            }
+        }
+    }
+
+    private void persistRunLog(java.util.UUID runId, RunLogCaptureRegistry.Capture capture, Instant capturedAt) {
+        RunLogCaptureRegistry.Snapshot snapshot = capture.snapshot();
+        runLogStore.replaceTerminal(new RunLog(runId, snapshot.content(), snapshot.truncated(),
+                snapshot.capturedBytes(), RunLog.CURRENT_FORMAT_VERSION, capturedAt, Instant.now()));
+    }
+
+    ActiveRunRegistry activeRunRegistry() {
+        return activeRunRegistry;
+    }
+
+    private void recordTerminalOutcome(JobRun run, JobRunStatus status, long rowsProcessed,
+                                       long durationMillis, String errorMessage) {
+        AuditAction action = switch (status) {
+            case SUCCEEDED -> AuditAction.RUN_SUCCEEDED;
+            case CANCELLED -> AuditAction.RUN_CANCELLED;
+            default -> AuditAction.RUN_FAILED;
+        };
+        AuditOutcome outcome = status == JobRunStatus.FAILED ? AuditOutcome.FAILURE : AuditOutcome.SUCCESS;
+        Map<String, String> detail = errorMessage == null
+                ? Map.of("rowsProcessed", Long.toString(rowsProcessed),
+                "durationMillis", Long.toString(durationMillis))
+                : Map.of("rowsProcessed", Long.toString(rowsProcessed),
+                "durationMillis", Long.toString(durationMillis), "errorMessage", errorMessage);
+        auditService.record(auditActorResolver.system(run.executorIdentity()), action,
+                AuditResourceType.JOB_RUN, run.id().toString(), outcome, detail);
+    }
+
+    private void recordIfUpdated(JobRunStore.FencedUpdateResult result, JobRun run, JobRunStatus status,
+                                 long rowsProcessed, long durationMillis, String errorMessage) {
+        if (result == JobRunStore.FencedUpdateResult.UPDATED) {
+            recordTerminalOutcome(run, status, rowsProcessed, durationMillis, errorMessage);
+            return;
+        }
+        LOG.warn("Ignoring stale finalization for JobRun {} with result {}", run.id(), result);
+    }
+
+    private static LeaseToken requireLeaseToken(JobRun run) {
+        if (run.leaseToken() == null) {
+            throw new IllegalStateException("JobRun " + run.id() + " has no lease token");
+        }
+        return run.leaseToken();
+    }
+
+    private static String redactedFailureMessage(String message) {
+        String redacted = CredentialRedactor.redactMessage(message);
+        if (redacted == null || redacted.isBlank()) {
+            return "Job execution failed";
+        }
+        return redacted.length() <= 512 ? redacted : redacted.substring(0, 512);
+    }
+}

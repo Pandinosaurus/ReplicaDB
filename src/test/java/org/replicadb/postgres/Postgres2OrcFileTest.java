@@ -7,14 +7,12 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.orc.OrcFile;
 import org.apache.orc.Reader;
-import org.junit.Rule;
 import org.junit.jupiter.api.*;
 import org.replicadb.ReplicaDB;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
 import org.replicadb.config.ReplicadbPostgresqlContainer;
 import org.replicadb.manager.file.FileFormats;
-import org.replicadb.manager.file.FileManager;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -22,7 +20,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Paths;
 import java.sql.*;
-import java.util.HashMap;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,7 +36,6 @@ class Postgres2OrcFileTest {
 
     private Connection postgresConn;
 
-    @Rule
     public static PostgreSQLContainer<ReplicadbPostgresqlContainer> postgres = ReplicadbPostgresqlContainer.getInstance();
 
     @BeforeAll
@@ -58,7 +54,6 @@ class Postgres2OrcFileTest {
         this.postgresConn.close();
 
         // Clean the static temFiles HasMap.
-        FileManager.setTempFilesPath(new HashMap<>());
     }
 
 

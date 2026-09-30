@@ -1,0 +1,60 @@
+spring:
+  main:
+    web-application-type: servlet
+  datasource:
+    url: ${DB_URL:}
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 8
+  flyway:
+    enabled: true
+  session:
+    store-type: none
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.mongo.MongoAutoConfiguration
+      - org.springframework.boot.autoconfigure.quartz.QuartzAutoConfiguration
+      - org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
+      - org.springframework.boot.autoconfigure.security.servlet.SecurityFilterAutoConfiguration
+      - org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+      - org.springframework.boot.autoconfigure.session.SessionAutoConfiguration
+      - org.springframework.boot.actuate.autoconfigure.security.servlet.ManagementWebSecurityAutoConfiguration
+logging:
+  config: classpath:log4j2-spring.xml
+server:
+  port: -1
+management:
+  server:
+    port: ${REPLICADB_WORKER_MANAGEMENT_PORT:9091}
+    address: ${REPLICADB_WORKER_MANAGEMENT_ADDRESS:127.0.0.1}
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,controlPlane,workerRuntime
+          show-components: always
+replicadb:
+  worker:
+    identity: ${REPLICADB_WORKER_IDENTITY:}
+    max-concurrent-runs: 1
+    lease-duration: 5m
+    heartbeat-interval: 30s
+    poll-interval: 30s
+    poll-batch-size: 100
+    listener:
+      initial-reconnect-delay: 1s
+      max-reconnect-delay: 30s
+    admission:
+      jitter-max: 100ms
+      generic-cooldown: 250ms
+      directed-queue-capacity: 1024
+      adaptive-backoff:
+        enabled: true
+        initial-delay: 25ms
+        max-delay: 2s
+        decay-half-life: 30s
+    shutdown-timeout: 30s

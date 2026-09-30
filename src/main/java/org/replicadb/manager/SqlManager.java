@@ -6,11 +6,16 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.replicadb.cli.ReplicationMode;
 import org.replicadb.cli.ToolOptions;
+import org.replicadb.manager.util.ColumnDescriptor;
+import org.replicadb.manager.util.WatermarkBinder;
 
 import java.io.IOException;
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -24,6 +29,7 @@ import java.util.concurrent.TimeUnit;
 public abstract class SqlManager extends ConnManager {
 
     private static final Logger LOG = LogManager.getLogger(SqlManager.class.getName());
+    private static final String DRIVER_PARAM_KEY = "driver";
 
     protected Connection connection;
     protected DataSourceType dsType;
@@ -33,6 +39,11 @@ public abstract class SqlManager extends ConnManager {
     private TimedSemaphore bandwidthRateLimiter;
     private int rowSize = 0;
     private long fetchs = 0L;
+    private boolean sinkTableJustCreated = false;
+
+    // Last SQL/bind args executed on the SOURCE side, reused by resolveWatermarkCandidate()'s MAX() probe.
+    private String lastReadSql;
+    private Object[] lastReadArgs;
 
     /**
      * Constructs the SqlManager.
@@ -120,12 +131,21 @@ public abstract class SqlManager extends ConnManager {
      * @param fetchSize Overrides default or parameterized fetch size
      * @return A ResultSet encapsulating the results or null on error
      */
+    @SuppressWarnings("null") // Java varargs guarantee args is never null (empty array when no args provided)
     protected ResultSet execute(String stmt, Integer fetchSize, Object... args)
             throws SQLException {
         // Release any previously-open statement.
         release();
 
         LOG.info("{}: Executing SQL statement: {}",Thread.currentThread().getName(), stmt);
+
+        // NEW: Add connection state logging
+        Connection conn = this.getConnection();
+        LOG.debug("{}: Connection state - autoCommit: {}, transactionIsolation: {}, isClosed: {}", 
+                  Thread.currentThread().getName(),
+                  conn.getAutoCommit(),
+                  conn.getTransactionIsolation(),
+                  conn.isClosed());
 
         PreparedStatement statement = this.getConnection().prepareStatement(stmt, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
 
@@ -134,20 +154,56 @@ public abstract class SqlManager extends ConnManager {
             statement.setFetchSize(fetchSize);
         }
         this.lastStatement = statement;
+        registerActiveStatement(statement);
         if (null != args) {
             for (int i = 0; i < args.length; i++) {
                 statement.setObject(i + 1, args[i]);
             }
         }
 
-        StringBuilder sb = new StringBuilder();
-        for (Object o : args) {
-            sb.append(o.toString())
-                    .append(", ");
+        // NEW: Enhanced parameter logging with types
+        if (null != args && args.length > 0) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Parameters bound [count=").append(args.length).append("]: ");
+            for (int i = 0; i < args.length; i++) {
+                Object arg = args[i];
+                sb.append("param").append(i+1).append("=")
+                  .append(arg == null ? "NULL" : arg.toString())
+                  .append(" (type=")
+                  .append(arg == null ? "null" : arg.getClass().getSimpleName())
+                  .append(")");
+                if (i < args.length - 1) sb.append(", ");
+            }
+            LOG.info("{}: {}", Thread.currentThread().getName(), sb);
+        } else {
+            LOG.info("{}: No parameters to bind", Thread.currentThread().getName());
         }
-        LOG.info("{}: With args: {}",Thread.currentThread().getName() , sb);
 
-        return statement.executeQuery();
+        if (DataSourceType.SOURCE.equals(this.dsType)) {
+            this.lastReadSql = stmt;
+            this.lastReadArgs = args;
+        }
+
+        ResultSet resultSet = statement.executeQuery();
+        
+        // NEW: Log ResultSet metadata immediately after execution
+        try {
+            ResultSetMetaData rsmd = resultSet.getMetaData();
+            int colCount = rsmd.getColumnCount();
+            LOG.debug("{}: ResultSet returned with {} columns", Thread.currentThread().getName(), colCount);
+            
+            // Log column names for debugging
+            StringBuilder colNames = new StringBuilder("Columns: ");
+            for (int i = 1; i <= colCount; i++) {
+                colNames.append(rsmd.getColumnName(i));
+                if (i < colCount) colNames.append(", ");
+            }
+            LOG.debug("{}: {}", Thread.currentThread().getName(), colNames);
+        } catch (SQLException e) {
+            LOG.warn("{}: Could not retrieve ResultSet metadata: {}", Thread.currentThread().getName(), e.getMessage());
+        }
+        
+        return resultSet;
     }
 
     /**
@@ -165,6 +221,9 @@ public abstract class SqlManager extends ConnManager {
         // Close connection, ignore exceptions
         if (this.connection != null) {
             try {
+                if (DataSourceType.SOURCE.equals(this.dsType) && !this.getConnection().getAutoCommit()) {
+                    this.getConnection().rollback();
+                }
                 this.getConnection().close();
             } catch (Exception e) {
                 LOG.error(e);
@@ -178,50 +237,49 @@ public abstract class SqlManager extends ConnManager {
      * Connection object.
      */
     protected Connection makeSourceConnection() throws SQLException {
-
-        Connection conn;
-        String driverClass = getDriverClass();
-
-        try {
-            Class.forName(driverClass);
-        } catch (ClassNotFoundException cnfe) {
-            throw new RuntimeException("Could not load db driver class: " + driverClass);
-        }
-
-        String username = options.getSourceUser();
-        String password = options.getSourcePassword();
-        String connectString = options.getSourceConnect();
-
-        Properties connectionParams = options.getSourceConnectionParams();
-        if (connectionParams != null && connectionParams.size() > 0) {
-            LOG.trace("User specified connection params. Using properties specific API for making connection.");
-
-            Properties props = new Properties();
-            if (username != null) {
-                props.put("user", username);
-            }
-
-            if (password != null) {
-                props.put("password", password);
-            }
-
-            props.putAll(connectionParams);
-            conn = DriverManager.getConnection(connectString, props);
-        } else {
-            LOG.trace("No connection parameters specified. Using regular API for making connection.");
-            if (username == null) {
-                conn = DriverManager.getConnection(connectString);
-            } else {
-                conn = DriverManager.getConnection(connectString, username, password);
-            }
-        }
-
-        conn.setAutoCommit(false);
-
-        return conn;
+        return makeConnection(DataSourceType.SOURCE);
     }
 
     protected Connection makeSinkConnection() throws SQLException {
+        return makeConnection(DataSourceType.SINK);
+    }
+
+    protected Properties buildConnectionProperties(DataSourceType dataSourceType) {
+        Properties connectionParams = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourceConnectionParams()
+                : options.getSinkConnectionParams();
+
+        if (connectionParams == null || connectionParams.isEmpty()) {
+            return null;
+        }
+
+        String username = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourceUser()
+                : options.getSinkUser();
+        String password = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourcePassword()
+                : options.getSinkPassword();
+
+        Properties props = new Properties();
+        if (username != null) {
+            props.put("user", username);
+        }
+        if (password != null) {
+            props.put("password", password);
+        }
+
+        props.putAll(connectionParams);
+        // Filter driver parameter - used for Class.forName() only, not JDBC connection
+        props.remove(DRIVER_PARAM_KEY);
+        return props;
+    }
+
+    protected void customizeConnectionProperties(DataSourceType dataSourceType, Properties properties)
+            throws SQLException {
+        // Database-specific managers may add or validate connection properties.
+    }
+
+    private Connection makeConnection(DataSourceType dataSourceType) throws SQLException {
 
         Connection conn;
         String driverClass = getDriverClass();
@@ -232,24 +290,24 @@ public abstract class SqlManager extends ConnManager {
             throw new RuntimeException("Could not load db driver class: " + driverClass);
         }
 
-        String username = options.getSinkUser();
-        String password = options.getSinkPassword();
-        String connectString = options.getSinkConnect();
+        String username = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourceUser()
+                : options.getSinkUser();
+        String password = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourcePassword()
+                : options.getSinkPassword();
+        String connectString = DataSourceType.SOURCE.equals(dataSourceType)
+                ? options.getSourceConnect()
+                : options.getSinkConnect();
 
-        Properties connectionParams = options.getSinkConnectionParams();
-        if (connectionParams != null && connectionParams.size() > 0) {
+        Properties props = buildConnectionProperties(dataSourceType);
+        if (props == null) {
+            props = new Properties();
+        }
+        customizeConnectionProperties(dataSourceType, props);
+
+        if (!props.isEmpty()) {
             LOG.trace("User specified connection params. Using properties specific API for making connection.");
-
-            Properties props = new Properties();
-            if (username != null) {
-                props.put("user", username);
-            }
-
-            if (password != null) {
-                props.put("password", password);
-            }
-
-            props.putAll(connectionParams);
             conn = DriverManager.getConnection(connectString, props);
         } else {
             LOG.trace("No connection parameters specified. Using regular API for making connection.");
@@ -268,6 +326,7 @@ public abstract class SqlManager extends ConnManager {
 
     public void release() {
         if (null != this.lastStatement) {
+            unregisterActiveStatement(this.lastStatement);
             try {
                 this.lastStatement.close();
             } catch (SQLException e) {
@@ -275,6 +334,27 @@ public abstract class SqlManager extends ConnManager {
             }
 
             this.lastStatement = null;
+        }
+    }
+
+    /**
+     * Resolves this task's highest observed watermark column value by issuing a follow-up
+     * {@code SELECT MAX(...)} probe wrapping the exact SQL/bind args of this task's own read.
+     */
+    @Override
+    public String resolveWatermarkCandidate(int taskId) throws SQLException {
+        if (options.getIncrementalWatermarkColumn() == null || lastReadSql == null) {
+            return null;
+        }
+
+        String maxSql = "SELECT MAX(" + escapeColName(options.getIncrementalWatermarkColumn())
+                + ") FROM (" + lastReadSql + ") wm_probe";
+        ResultSet rs = execute(maxSql, lastReadArgs);
+        try {
+            rs.next();
+            return rs.getString(1);
+        } finally {
+            release();
         }
     }
 
@@ -369,12 +449,33 @@ public abstract class SqlManager extends ConnManager {
         } else {
             tableName = getSinkTableName();
         }
-        String sql = sqlCommand + tableName;
-        LOG.info("Truncating sink table with this command: {}", sql);
+        String truncateSql = sqlCommand + tableName;
+        LOG.info("Truncating sink table with this command: {}", truncateSql);
+        
         Statement statement = this.getConnection().createStatement();
-        statement.executeUpdate(sql);
-        statement.close();
-        this.getConnection().commit();
+        try {
+            statement.executeUpdate(truncateSql);
+            statement.close();
+            this.getConnection().commit();
+        } catch (SQLException e) {
+            LOG.warn("TRUNCATE failed ({}), falling back to DELETE FROM: {}", e.getMessage(), tableName);
+            statement.close();
+            
+            // Fallback to DELETE FROM for databases with TRUNCATE issues (DB2, etc.)
+            String deleteSql = "DELETE FROM " + tableName;
+            LOG.info("Deleting all rows from sink table with this command: {}", deleteSql);
+            Statement deleteStatement = this.getConnection().createStatement();
+            try {
+                deleteStatement.executeUpdate(deleteSql);
+                deleteStatement.close();
+                this.getConnection().commit();
+                LOG.info("DELETE FROM succeeded as fallback for table: {}", tableName);
+            } catch (SQLException deleteEx) {
+                deleteStatement.close();
+                LOG.error("Both TRUNCATE and DELETE FROM failed for table: {}", tableName, deleteEx);
+                throw deleteEx;
+            }
+        }
     }
 
     /**
@@ -402,35 +503,41 @@ public abstract class SqlManager extends ConnManager {
      * @throws SQLException
      */
     public void atomicInsertStagingTable() throws SQLException {
+        checkCancellation();
         Statement statement = this.getConnection().createStatement();
+        registerActiveStatement(statement);
         StringBuilder sql = new StringBuilder();
-        String allColls = null;
         try {
-            allColls = getAllSinkColumns(null);
-        } catch (NullPointerException e) {
-            // Ignore this exception
-        }
+            String allColls = null;
+            try {
+                allColls = getAllSinkColumns(null);
+            } catch (NullPointerException e) {
+                // Ignore this exception
+            }
 
-        if (allColls != null) {
-            sql.append(" INSERT INTO ")
-                    .append(this.getSinkTableName())
-                    .append(" (" + allColls + ")")
-                    .append(" SELECT ")
-                    .append(allColls)
-                    .append(" FROM ")
-                    .append(getQualifiedStagingTableName());
-        } else {
-            sql.append(" INSERT INTO ")
-                    .append(this.getSinkTableName())
-                    .append(" SELECT * ")
-                    .append(" FROM ")
-                    .append(getQualifiedStagingTableName());
-        }
+            if (allColls != null) {
+                sql.append(" INSERT INTO ")
+                        .append(this.getSinkTableName())
+                        .append(" (" + allColls + ")")
+                        .append(" SELECT ")
+                        .append(allColls)
+                        .append(" FROM ")
+                        .append(getQualifiedStagingTableName());
+            } else {
+                sql.append(" INSERT INTO ")
+                        .append(this.getSinkTableName())
+                        .append(" SELECT * ")
+                        .append(" FROM ")
+                        .append(getQualifiedStagingTableName());
+            }
 
-        LOG.info("Inserting data from staging table to sink table within a transaction: {}", sql);
-        statement.executeUpdate(sql.toString());
-        statement.close();
-        this.getConnection().commit();
+            LOG.info("Inserting data from staging table to sink table within a transaction: {}", sql);
+            statement.executeUpdate(sql.toString());
+            this.getConnection().commit();
+        } finally {
+            unregisterActiveStatement(statement);
+            statement.close();
+        }
     }
 
     /**
@@ -456,7 +563,12 @@ public abstract class SqlManager extends ConnManager {
      * @throws SQLException
      */
     public void dropStagingTable() throws SQLException {
-        // TODO: Do not drop stagging table if it's defined by user.
+        // Only drop staging table if it was created automatically
+        if (options.getSinkStagingTable() != null && !options.getSinkStagingTable().isEmpty()) {
+            LOG.info("Skipping staging table drop because it is user-defined: {}", getQualifiedStagingTableName());
+            return;
+        }
+        
         Statement statement = this.getConnection().createStatement();
         String sql = "DROP TABLE " + getQualifiedStagingTableName();
         LOG.info("Dropping staging table with this command: {}", sql);
@@ -469,6 +581,11 @@ public abstract class SqlManager extends ConnManager {
     @Override
     public Future<Integer> preSinkTasks(ExecutorService executor) throws Exception {
 
+        // Auto-create sink table if enabled and table doesn't exist
+        if (options.isSinkAutoCreate()) {
+            autoCreateSinkTable();
+        }
+
         // Create staging table
         // If mode is not COMPLETE
         if (!options.getMode().equals(ReplicationMode.COMPLETE.getModeText())) {
@@ -476,11 +593,15 @@ public abstract class SqlManager extends ConnManager {
             // Only create staging table if it is not defined by the user
             if (options.getSinkStagingTable() == null || options.getSinkStagingTable().isEmpty()) {
 
-                // If the staging parameters have not been defined then the table is created in the public schema
+                // If the staging parameters have not been defined then use the sink table's schema
                 if (options.getSinkStagingSchema() == null || options.getSinkStagingSchema().isEmpty()) {
-                    // TODO: This is only valid for PostgreSQL
-                    LOG.warn("No staging schema is defined, setting it as PUBLIC");
-                    options.setSinkStagingSchema("public");
+                    String sinkSchema = getSchemaFromQualifiedTableName(getSinkTableName());
+                    if (sinkSchema != null && !sinkSchema.isEmpty()) {
+                        LOG.debug("No staging schema defined, using sink table schema: {}", sinkSchema);
+                        options.setSinkStagingSchema(sinkSchema);
+                    } else {
+                        LOG.debug("No staging schema defined and no schema in sink table name, letting JDBC driver use default");
+                    }
                 }
                 this.createStagingTable();
             }
@@ -490,9 +611,11 @@ public abstract class SqlManager extends ConnManager {
         if (options.getMode().equals(ReplicationMode.COMPLETE_ATOMIC.getModeText())) {
             return atomicDeleteSinkTable(executor);
         } else {
-            // Truncate sink table if it is enabled
-            if (!options.isSinkDisableTruncate()) {
+            // Truncate sink table if it is enabled and the table was not just created
+            if (!options.isSinkDisableTruncate() && !sinkTableJustCreated) {
                 this.truncateTable();
+            } else if (sinkTableJustCreated) {
+                LOG.debug("Skipping truncate because table was just created");
             }
 
             return null;
@@ -636,6 +759,343 @@ public abstract class SqlManager extends ConnManager {
             return rs.getBlob(columnIndex);
         } catch (SQLFeatureNotSupportedException e) {
             return null;
+        }
+    }
+
+    /**
+     * Default implementation of preSourceTasks that probes source metadata when auto-create is enabled
+     * or when an incremental watermark column is declared.
+     * Concrete managers can override this and call super.preSourceTasks() if needed.
+     */
+    @Override
+    public void preSourceTasks() throws Exception {
+        if (options.isSinkAutoCreate() || options.getIncrementalWatermarkColumn() != null) {
+            probeSourceMetadata();
+        }
+        if (options.getIncrementalWatermarkColumn() != null) {
+            // Fail fast here, before any parallel task starts reading, rather than later inside readTable().
+            WatermarkBinder.resolveColumnType(options.getSourceColumnDescriptors(), options.getIncrementalWatermarkColumn());
+        }
+    }
+
+    /**
+     * Probes source metadata by executing a lightweight query (SELECT * WHERE 1=0)
+     * and extracts column metadata and primary keys.
+     */
+    protected void probeSourceMetadata() throws SQLException {
+        LOG.info("Probing source metadata for auto-create...");
+        
+        String probeQuery;
+        // Determine columns to probe - respect --source-columns if specified
+        String columnsToProbe = "*";
+        if (options.getSourceColumns() != null && !options.getSourceColumns().isEmpty()) {
+            columnsToProbe = options.getSourceColumns();
+            LOG.info("Using specified source-columns for metadata probing: {}", columnsToProbe);
+        }
+        
+        // Prioritize source-query over source-table for metadata probing
+        // (both can be set: query for data, table for PK metadata)
+        if (options.getSourceQuery() != null && !options.getSourceQuery().isEmpty()) {
+            // Query-based source
+            probeQuery = "SELECT " + columnsToProbe + " FROM (" + options.getSourceQuery() + ") tmp WHERE 1=0";
+        } else if (options.getSourceTable() != null && !options.getSourceTable().isEmpty()) {
+            // Table-based source
+            probeQuery = "SELECT " + columnsToProbe + " FROM " + escapeTableName(options.getSourceTable()) + " WHERE 1=0";
+        } else {
+            throw new IllegalArgumentException("Either source-table or source-query must be specified for auto-create");
+        }
+
+        Statement stmt = null;
+        ResultSet rs = null;
+        try {
+            stmt = this.getConnection().createStatement();
+            rs = stmt.executeQuery(probeQuery);
+            
+            ResultSetMetaData rsmd = rs.getMetaData();
+            int columnCount = rsmd.getColumnCount();
+            
+            List<ColumnDescriptor> columnDescriptors = new ArrayList<>();
+            Set<String> columnNames = new HashSet<>();
+            for (int i = 1; i <= columnCount; i++) {
+                String columnName = rsmd.getColumnName(i);
+                int jdbcType = rsmd.getColumnType(i);
+                int precision = rsmd.getPrecision(i);
+                int scale = rsmd.getScale(i);
+                int nullable = rsmd.isNullable(i);
+                
+                columnDescriptors.add(new ColumnDescriptor(columnName, jdbcType, precision, scale, nullable));
+                columnNames.add(columnName.toUpperCase());
+            }
+            
+            options.setSourceColumnDescriptors(columnDescriptors);
+            LOG.info("Captured {} column descriptors from source", columnCount);
+            
+            // Get primary keys (only for table-based source)
+            if (options.getSourceTable() != null && !options.getSourceTable().isEmpty()) {
+                String table = getTableNameFromQualifiedTableName(options.getSourceTable());
+                String schema = getSchemaFromQualifiedTableName(options.getSourceTable());
+                
+                LOG.debug("Probing primary keys for schema='{}', table='{}'", schema, table);
+                
+                DatabaseMetaData metaData = this.getConnection().getMetaData();
+                ResultSet pkResults = null;
+                boolean foundPKs = false;
+                String effectiveSchema = schema;
+                String effectiveTable = table;
+                
+                // Try as-is first
+                try {
+                    pkResults = metaData.getPrimaryKeys(null, schema, table);
+                    if (pkResults != null && pkResults.next()) {
+                        foundPKs = true;
+                        LOG.debug("Found PKs using original case: schema='{}', table='{}'", schema, table);
+                    }
+                    if (pkResults != null) pkResults.close();
+                } catch (SQLException e) {
+                    LOG.debug("Error querying PKs with original case: {}", e.getMessage());
+                    if (pkResults != null) try { pkResults.close(); } catch (SQLException ex) { /* ignore */ }
+                }
+                
+                // Try uppercase if not found
+                if (!foundPKs) {
+                    String tableUpper = table != null ? table.toUpperCase() : null;
+                    String schemaUpper = schema != null ? schema.toUpperCase() : null;
+                    try {
+                        pkResults = metaData.getPrimaryKeys(null, schemaUpper, tableUpper);
+                        if (pkResults != null && pkResults.next()) {
+                            foundPKs = true;
+                            effectiveSchema = schemaUpper;
+                            effectiveTable = tableUpper;
+                            LOG.debug("Found PKs using uppercase: schema='{}', table='{}'", schemaUpper, tableUpper);
+                        }
+                        if (pkResults != null) pkResults.close();
+                    } catch (SQLException e) {
+                        LOG.debug("Error querying PKs with uppercase: {}", e.getMessage());
+                        if (pkResults != null) try { pkResults.close(); } catch (SQLException ex) { /* ignore */ }
+                    }
+                }
+                
+                // Try lowercase if still not found
+                if (!foundPKs) {
+                    String tableLower = table != null ? table.toLowerCase() : null;
+                    String schemaLower = schema != null ? schema.toLowerCase() : null;
+                    try {
+                        pkResults = metaData.getPrimaryKeys(null, schemaLower, tableLower);
+                        if (pkResults != null && pkResults.next()) {
+                            foundPKs = true;
+                            effectiveSchema = schemaLower;
+                            effectiveTable = tableLower;
+                            LOG.debug("Found PKs using lowercase: schema='{}', table='{}'", schemaLower, tableLower);
+                        }
+                        if (pkResults != null) pkResults.close();
+                    } catch (SQLException e) {
+                        LOG.debug("Error querying PKs with lowercase: {}", e.getMessage());
+                        if (pkResults != null) try { pkResults.close(); } catch (SQLException ex) { /* ignore */ }
+                    }
+                }
+                
+                // If found, re-query with the effective case variant and process results
+                if (foundPKs) {
+                    pkResults = metaData.getPrimaryKeys(null, effectiveSchema, effectiveTable);
+                    try {
+                        ArrayList<String> pkList = new ArrayList<>();
+                        while (pkResults.next()) {
+                            pkList.add(pkResults.getString("COLUMN_NAME"));
+                        }
+                        
+                        if (!pkList.isEmpty()) {
+                            // Sort by KEY_SEQ - re-query with ordering
+                            pkResults.close();
+                            pkResults = metaData.getPrimaryKeys(null, effectiveSchema, effectiveTable);
+                            pkList.clear();
+                            while (pkResults.next()) {
+                                int keySeq = pkResults.getInt("KEY_SEQ");
+                                String colName = pkResults.getString("COLUMN_NAME");
+                                // Ensure we have the right size
+                                while (pkList.size() < keySeq) {
+                                    pkList.add(null);
+                                }
+                                pkList.set(keySeq - 1, colName);
+                            }
+                            
+                            // Filter primary keys to only include columns in the probed column list
+                            List<String> filteredPkList = new ArrayList<>();
+                            for (String pk : pkList) {
+                                if (pk != null && columnNames.contains(pk.toUpperCase())) {
+                                    filteredPkList.add(pk);
+                                } else if (pk != null) {
+                                    LOG.warn("Primary key column '{}' is not in the source-columns list and will be excluded", pk);
+                                }
+                            }
+                            
+                            if (!filteredPkList.isEmpty()) {
+                                String[] pks = filteredPkList.toArray(new String[0]);
+                                options.setSourcePrimaryKeys(pks);
+                                LOG.info("Captured {} primary key columns from source (after filtering)", pks.length);
+                            } else {
+                                LOG.warn("No primary keys remain after filtering by source-columns");
+                                if (options.getMode() != null && options.getMode().toLowerCase().contains("incremental")) {
+                                    LOG.warn("Incremental mode requires primary keys, but all PK columns were excluded by --source-columns");
+                                }
+                            }
+                        } else {
+                            LOG.warn("No primary keys found on source table after trying multiple case variants");
+                        }
+                    } finally {
+                        if (pkResults != null) pkResults.close();
+                    }
+                } else {
+                    LOG.warn("No primary keys found on source table after trying multiple case variants");
+                }
+            } else {
+                LOG.info("Source is a custom query, no primary keys available");
+            }
+            
+        } finally {
+            if (rs != null) try { rs.close(); } catch (SQLException e) { /* ignore */ }
+            if (stmt != null) try { stmt.close(); } catch (SQLException e) { /* ignore */ }
+        }
+    }
+
+    /**
+     * Checks if the sink table exists using DatabaseMetaData.getTables()
+     * with three-case-variant retry (as-is, UPPERCASE, lowercase).
+     */
+    protected boolean sinkTableExists() throws SQLException {
+        String tableName = getSinkTableName();
+        String table = getTableNameFromQualifiedTableName(tableName);
+        String schema = getSchemaFromQualifiedTableName(tableName);
+        
+        DatabaseMetaData metaData = this.getConnection().getMetaData();
+        
+        // Try as-is
+        ResultSet rs = metaData.getTables(null, schema, table, new String[]{"TABLE"});
+        try {
+            if (rs.next()) {
+                LOG.debug("Table exists: schema={}, table={}", schema, table);
+                return true;
+            }
+        } finally {
+            rs.close();
+        }
+        
+        // Try UPPERCASE
+        String tableUpper = table != null ? table.toUpperCase() : null;
+        String schemaUpper = schema != null ? schema.toUpperCase() : null;
+        rs = metaData.getTables(null, schemaUpper, tableUpper, new String[]{"TABLE"});
+        try {
+            if (rs.next()) {
+                LOG.debug("Table exists (uppercase): schema={}, table={}", schemaUpper, tableUpper);
+                return true;
+            }
+        } finally {
+            rs.close();
+        }
+        
+        // Try lowercase
+        String tableLower = table != null ? table.toLowerCase() : null;
+        String schemaLower = schema != null ? schema.toLowerCase() : null;
+        rs = metaData.getTables(null, schemaLower, tableLower, new String[]{"TABLE"});
+        try {
+            if (rs.next()) {
+                LOG.debug("Table exists (lowercase): schema={}, table={}", schemaLower, tableLower);
+                return true;
+            }
+        } finally {
+            rs.close();
+        }
+        
+        LOG.debug("Table does not exist: {}", tableName);
+        return false;
+    }
+
+    /**
+     * Abstract method to map JDBC type codes to database-native DDL type fragments.
+     * Each manager must implement this with its database-specific type mappings.
+     */
+    protected abstract String mapJdbcTypeToNativeDDL(String columnName, int jdbcType, int precision, int scale);
+
+    /**
+     * Generates CREATE TABLE DDL from column descriptors and primary keys.
+     */
+    protected String generateCreateTableDDL(String tableName, List<ColumnDescriptor> columns, String[] primaryKeys) {
+        StringBuilder ddl = new StringBuilder();
+        ddl.append("CREATE TABLE ").append(escapeTableName(tableName)).append(" (\n");
+        
+        for (int i = 0; i < columns.size(); i++) {
+            ColumnDescriptor col = columns.get(i);
+            ddl.append("  ").append(escapeColName(col.getColumnName())).append(" ");
+            ddl.append(mapJdbcTypeToNativeDDL(col.getColumnName(), col.getJdbcType(), col.getPrecision(), col.getScale()));
+            
+            // Add NOT NULL if the column is not nullable
+            if (col.getNullable() == ResultSetMetaData.columnNoNulls) {
+                ddl.append(" NOT NULL");
+            }
+            
+            if (i < columns.size() - 1 || (primaryKeys != null && primaryKeys.length > 0)) {
+                ddl.append(",");
+            }
+            ddl.append("\n");
+        }
+        
+        // Add PRIMARY KEY constraint if present
+        if (primaryKeys != null && primaryKeys.length > 0) {
+            ddl.append("  PRIMARY KEY (");
+            for (int i = 0; i < primaryKeys.length; i++) {
+                ddl.append(escapeColName(primaryKeys[i]));
+                if (i < primaryKeys.length - 1) {
+                    ddl.append(", ");
+                }
+            }
+            ddl.append(")\n");
+        }
+        
+        ddl.append(")");
+        return ddl.toString();
+    }
+
+    /**
+     * Auto-creates the sink table if it doesn't exist, using source metadata.
+     */
+    protected void autoCreateSinkTable() throws SQLException {
+        String tableName = getSinkTableName();
+        
+        if (sinkTableExists()) {
+            LOG.info("Sink table {} already exists, skipping auto-create", tableName);
+            return;
+        }
+        
+        LOG.info("Sink table {} does not exist, creating it...", tableName);
+        
+        List<ColumnDescriptor> sourceColumns = options.getSourceColumnDescriptors();
+        String[] sourcePKs = options.getSourcePrimaryKeys();
+        
+        if (sourceColumns == null || sourceColumns.isEmpty()) {
+            throw new IllegalStateException("Source column descriptors not available. Probe may have failed.");
+        }
+        
+        // Warn if incremental mode but no PKs
+        if (options.getMode().equals(ReplicationMode.INCREMENTAL.getModeText())) {
+            if (sourcePKs == null || sourcePKs.length == 0) {
+                LOG.warn("Incremental mode requires primary keys, but none are available. " +
+                        "The table will be created without a PRIMARY KEY constraint, and replication will likely fail during merge.");
+            }
+        }
+        
+        // Use qualified table name for CREATE TABLE to ensure proper schema placement
+        String qualifiedTableName = getQualifiedSinkTableName();
+        String ddl = generateCreateTableDDL(qualifiedTableName, sourceColumns, sourcePKs);
+        LOG.info("Executing DDL:\n{}", ddl);
+        
+        Statement stmt = null;
+        try {
+            stmt = this.getConnection().createStatement();
+            stmt.execute(ddl);
+            this.getConnection().commit();
+            sinkTableJustCreated = true;
+            LOG.info("Successfully created sink table {}", qualifiedTableName);
+        } finally {
+            if (stmt != null) try { stmt.close(); } catch (SQLException e) { /* ignore */ }
         }
     }
 
